@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Data files (may contain PII)
+*.csv
+*.xlsx
+*.txt
+
+# Word docs
+*.docx
