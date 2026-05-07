@@ -7,6 +7,7 @@
 #   - "COMMON EDITS"  (where to change common behaviors)
 #
 import calendar
+import copy
 import csv
 import datetime as dt
 import hashlib
@@ -15,11 +16,39 @@ import os
 import re
 import secrets
 import uuid
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
 
 
 ScrambleMode = Literal["full scramble", "date scramble", "no scramble", "delete data", "shuffle values"]
+
+
+class EncryptedXlsxError(ValueError):
+    """Raised when an xlsx file is encrypted and no password was supplied."""
+
+
+def _decrypt_xlsx(path: str, password: str) -> "io.BytesIO":
+    """Decrypt a password-protected xlsx file in-memory and return a BytesIO.
+
+    The returned object can be passed directly to openpyxl.load_workbook().
+    No decrypted file is written to disk.
+    """
+    import io
+    try:
+        import msoffcrypto  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "msoffcrypto-tool is required to open encrypted files. "
+            "Run: pip install msoffcrypto-tool"
+        ) from e
+    buf = io.BytesIO()
+    with open(path, "rb") as f:
+        office_file = msoffcrypto.OfficeFile(f)
+        office_file.load_key(password=password)
+        office_file.decrypt(buf)
+    buf.seek(0)
+    return buf
+
 
 ISO_DATE_RE = re.compile(r"(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})")
 US_DATE_RE = re.compile(r"\b(?P<m>\d{1,2})/(?P<d>\d{1,2})/(?P<y>\d{4})\b")
@@ -40,28 +69,35 @@ def is_program_project_stable_header(header: str) -> bool:
     return header_contains_any(header, ["program", "project"]) and not header_contains_any(header, ["date"])
 
 
-def is_dob_like_header(header: str) -> bool:
-    return header_contains_any(header, ["age", "birth", "dob"])
+def _col_looks_like_dates(samples: List[str], threshold: float = 0.5) -> bool:
+    """Return True if at least *threshold* fraction of non-blank sampled strings match a date pattern.
+
+    Uses the same ISO_DATE_RE / US_DATE_RE patterns used during scrambling, so detection
+    is consistent with what the date-scramble mode actually processes.
+    """
+    non_blank = [s for s in samples if s.strip()]
+    if not non_blank:
+        return False
+    hits = sum(1 for s in non_blank if ISO_DATE_RE.search(s) or US_DATE_RE.search(s))
+    return hits / len(non_blank) >= threshold
 
 
-def is_dateish_header(header: str) -> bool:
-    # Grouping helper for UI defaults
-    return header_contains_any(header, ["date", "time"]) or is_dob_like_header(header)
+def default_mode_for_column(header: str, *, is_date: bool = False) -> ScrambleMode:
+    # BUSINESS RULE (defaults) — used by CLI and as pipeline fallback when modes are missing:
+    # - Program/Project columns (header contains "program"/"project" but not "date") stay stable.
+    # - Columns whose cell values look like dates (detected by sampling) default to "date scramble".
+    # - Everything else defaults to "full scramble".
+    # The GUI app overrides this by initializing every dropdown to "no scramble" (see csv_scrambler_app.py).
+    if is_program_project_stable_header(header):
+        return "no scramble"
+    if is_date:
+        return "date scramble"
+    return "full scramble"
 
 
 def default_mode_for_header(header: str) -> ScrambleMode:
-    # BUSINESS RULE (defaults):
-    # - Program/Project columns stay stable unless the header contains "Date"
-    # - DOB-like columns default to "date scramble" to preserve minor/TAY/adult bucket as-of today
-    # - Other date/time columns default to "date scramble"
-    # - Everything else defaults to "full scramble"
-    if is_program_project_stable_header(header):
-        return "no scramble"
-    if is_dob_like_header(header):
-        return "date scramble"
-    if header_contains_any(header, ["date", "time"]):
-        return "date scramble"
-    return "full scramble"
+    # Backward-compat wrapper for callers that have no column samples (e.g. CLI fallback).
+    return default_mode_for_column(header)
 
 
 def _hmac_bytes(seed: bytes, msg: str) -> bytes:
@@ -175,10 +211,6 @@ class ColumnContext:
     header: str
     mode: ScrambleMode
 
-    @property
-    def is_dob_like(self) -> bool:
-        return is_dob_like_header(self.header)
-
 
 def _replace_protected_substrings_with_placeholders(
     *, seed: bytes, text: str, col: ColumnContext, as_of: dt.date
@@ -195,11 +227,11 @@ def _replace_protected_substrings_with_placeholders(
 
     def scramble_date(d: dt.date, scope: str, original_str: str) -> dt.date:
         extra_key = f"{col.header}|{original_str}"
-        if col.is_dob_like:
-            return _scramble_dob_preserve_bucket_same_month_year(
-                seed=seed, original_dob=d, as_of=as_of, extra_key=extra_key
-            )
-        return _scramble_day_same_month_year(seed=seed, original=d, scope_tag=scope, extra_key=extra_key)
+        # BUSINESS RULE: all date-scrambled columns use bucket-preserving logic.
+        # This ensures minor/TAY/adult age buckets are never exposed regardless of column type.
+        return _scramble_dob_preserve_bucket_same_month_year(
+            seed=seed, original_dob=d, as_of=as_of, extra_key=extra_key
+        )
 
     def iso_sub(m: re.Match) -> str:
         original_str = m.group(0)
@@ -248,7 +280,11 @@ def scramble_cell(*, seed: bytes, value: str, col: ColumnContext, as_of: dt.date
 
 
 class ShuffleValuesError(Exception):
-    pass
+    """Raised when shuffle-values reassignment is impossible for a column."""
+
+    def __init__(self, message: str, *, column_key: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.column_key = column_key
 
 
 def make_shuffle_derangement(values: List[str]) -> List[str]:
@@ -293,11 +329,12 @@ def make_shuffle_derangement(values: List[str]) -> List[str]:
     raise ShuffleValuesError("Unable to find a shuffle where every row changes.")
 
 
-@dataclass(frozen=True)
+@dataclass
 class RunResult:
     scrambled_output_path: str
     keyed_original_output_path: Optional[str]
     row_count: int
+    warnings: List[str] = field(default_factory=list)
 
 
 def _validate_unique_headers(headers: List[str], *, sheet_name: Optional[str] = None) -> None:
@@ -315,18 +352,164 @@ def _validate_unique_headers(headers: List[str], *, sheet_name: Optional[str] = 
         raise ValueError(f"Duplicate headers are not supported: {detail}")
 
 
+_EXCEL_ERROR_RE = re.compile(r"^#[A-Z/]+[!?]?$")  # matches #REF!, #VALUE!, #N/A, #DIV/0!, etc.
+
+
+def _is_excel_error(v: object) -> bool:
+    return bool(v and _EXCEL_ERROR_RE.match(str(v)))
+
+
+# ---------------------------------------------------------------------------
+# Conditional-formatting coordinate helpers
+# ---------------------------------------------------------------------------
+_CELL_REF_RE = re.compile(r"(\$?)([A-Z]+)(\$?)(\d+)")
+_CROSS_SHEET_REF_RE = re.compile(
+    r"(?:'([^']+)'|([A-Za-z]\w*))!(\$?[A-Z]+\$?\d+(?::\$?[A-Z]+\$?\d+)?)"
+)
+
+
+def _shift_sqref(sqref: str, col_delta: int, row_delta: int) -> str:
+    """Shift every cell reference in a sqref string by col_delta columns and row_delta rows."""
+    def _shift_ref(m: re.Match) -> str:  # type: ignore[type-arg]
+        col_abs, col_letters, row_abs, row_num = m.group(1), m.group(2), m.group(3), int(m.group(4))
+        try:
+            from openpyxl.utils import get_column_letter, column_index_from_string  # type: ignore
+            new_col = get_column_letter(max(1, column_index_from_string(col_letters) + col_delta))
+        except Exception:
+            new_col = col_letters  # leave unchanged on import failure
+        new_row = max(1, row_num + row_delta)
+        return f"{col_abs}{new_col}{row_abs}{new_row}"
+    return _CELL_REF_RE.sub(_shift_ref, sqref)
+
+
+def _shift_formula(
+    formula: str,
+    col_delta: int,
+    local_row_delta: int,
+    hdr_row_by_sheet: Dict[str, int],
+) -> Optional[str]:
+    """Return a formula string with all cell references shifted, or None if it cannot be rewritten.
+
+    Returns None for formulas containing INDIRECT() (dynamic references) or external workbook
+    references ([File.xlsx]Sheet!...) which cannot be statically adjusted.
+    """
+    if re.search(r"\bINDIRECT\s*\(", formula, re.IGNORECASE):
+        return None
+    if re.search(r"\[[^\]]+\]", formula):  # external workbook reference
+        return None
+
+    def _shift_cross(m: re.Match) -> str:  # type: ignore[type-arg]
+        sheet_name = m.group(1) or m.group(2)
+        ref_part = m.group(3)
+        other_hdr_row = hdr_row_by_sheet.get(sheet_name, 1)
+        other_row_delta = 1 - other_hdr_row
+        shifted_ref = _shift_sqref(ref_part, col_delta, other_row_delta)
+        quoted = f"'{sheet_name}'" if " " in sheet_name else sheet_name
+        return f"{quoted}!{shifted_ref}"
+
+    result = _CROSS_SHEET_REF_RE.sub(_shift_cross, formula)
+    result = _shift_sqref(result, col_delta, local_row_delta)
+    return result
+
+
+def _detect_cross_sheet_breaks(wb, include_sheets: List[str]) -> List[str]:  # type: ignore[no-untyped-def]
+    """Return human-readable warnings when an included sheet's CF rules reference excluded sheets."""
+    include_set = set(include_sheets)
+    all_titles = {ws.title for ws in wb.worksheets}
+    seen: Set[str] = set()
+    out: List[str] = []
+
+    for ws in wb.worksheets:
+        if ws.title not in include_set:
+            continue
+        for cf in ws.conditional_formatting:
+            for rule in cf.rules:
+                formulas = getattr(rule, "formula", None) or []
+                if not formulas:
+                    continue
+                for f_str in formulas:
+                    if not isinstance(f_str, str):
+                        continue
+                    for m in _CROSS_SHEET_REF_RE.finditer(f_str):
+                        ref_sheet = m.group(1) or m.group(2)
+                        if ref_sheet not in all_titles:
+                            continue
+                        if ref_sheet not in include_set:
+                            msg = (
+                                f"Sheet '{ws.title}' has a conditional formatting rule that references "
+                                f"'{ref_sheet}' (excluded from export)"
+                            )
+                            if msg not in seen:
+                                seen.add(msg)
+                                out.append(msg)
+    return out
+
+
+def detect_cross_sheet_cf_breaks(
+    input_path: str,
+    include_sheets: List[str],
+    password: Optional[str] = None,
+) -> List[str]:
+    """Load workbook and return CF cross-sheet dependency warnings (for GUI pre-export check)."""
+    import zipfile
+
+    try:
+        import openpyxl  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Excel support requires openpyxl.") from e
+
+    try:
+        if password is not None:
+            wb = openpyxl.load_workbook(_decrypt_xlsx(input_path, password), data_only=True)
+        else:
+            wb = openpyxl.load_workbook(input_path, data_only=True)
+    except zipfile.BadZipFile as e:
+        raise EncryptedXlsxError(
+            "This file is password-protected. Select it again and enter the password when prompted."
+        ) from e
+    return _detect_cross_sheet_breaks(wb, include_sheets)
+
+
+# ---------------------------------------------------------------------------
+
+
 def _xlsx_header_row(ws) -> int:  # type: ignore[no-untyped-def]
     """Return the 1-based row number that contains per-column headers for this worksheet.
 
-    Some Excel reports put section-group labels in row 1 (mostly empty / merged cells)
-    and the real column headers in row 2.  If more than half of row 1 is empty we
-    treat row 2 as the header row so the app reads the correct headers and data.
+    Detection order:
+    1. AutoFilter reference — Excel always places filter dropdowns on the header row.
+       ws.auto_filter.ref is a range string like "A5:G200"; we extract the first row.
+    2. Density scan — scan rows 1–20 and return the first row where more than half of
+       its cells are non-empty and not Excel error strings (handles any number of
+       preamble rows: titles, date stamps, notes, merged group labels, etc.).
+    3. Fall back to row 1 if nothing else matches.
     """
+    # Strategy 1: AutoFilter reference
+    try:
+        af_ref = ws.auto_filter.ref  # type: ignore[union-attr]
+        if af_ref:
+            from openpyxl.utils.cell import coordinate_to_tuple  # type: ignore
+            first_cell = str(af_ref).split(":")[0]
+            row, _ = coordinate_to_tuple(first_cell)
+            if 1 <= row <= 20:
+                return row
+    except Exception:
+        pass
+
+    # Strategy 2: generalized density scan (up to 20 preamble rows)
     max_col = ws.max_column or 0
     if max_col == 0:
         return 1
-    empty_count = sum(1 for c in range(1, max_col + 1) if not ws.cell(1, c).value)
-    return 2 if empty_count > max_col / 2 else 1
+    max_scan = min(20, ws.max_row or 1)
+    for r in range(1, max_scan + 1):
+        non_empty = sum(
+            1 for c in range(1, max_col + 1)
+            if ws.cell(r, c).value and not _is_excel_error(ws.cell(r, c).value)
+        )
+        if non_empty > max_col / 2:
+            return r
+
+    return 1
 
 
 def scramble_csv_file(
@@ -392,7 +575,7 @@ def scramble_csv_file(
         try:
             new_vals = make_shuffle_derangement(vals)
         except ShuffleValuesError as e:
-            raise ShuffleValuesError(f"{h}: {e}") from e
+            raise ShuffleValuesError(f"{h}: {e}", column_key=h) from e
         shuffled_assignment[h] = {row_idxs[i]: new_vals[i] for i in range(len(row_idxs))}
 
     keyed_original_path: Optional[str] = None
@@ -458,6 +641,24 @@ def scramble_csv_file(
     )
 
 
+def _copy_cell_static_style(src, dst) -> None:  # type: ignore[no-untyped-def]
+    """Copy static cell styling from *src* to *dst* (fill, font, border, alignment, etc.).
+
+    When copying across workbooks, copy individual style objects—not *_style* indices.
+    """
+    if not getattr(src, "has_style", False):
+        return
+    try:
+        dst.fill = copy.copy(src.fill)
+        dst.font = copy.copy(src.font)
+        dst.border = copy.copy(src.border)
+        dst.alignment = copy.copy(src.alignment)
+        dst.number_format = src.number_format
+        dst.protection = copy.copy(src.protection)
+    except Exception:
+        pass
+
+
 def scramble_xlsx_file(
     *,
     input_path: str,
@@ -466,6 +667,8 @@ def scramble_xlsx_file(
     create_keyed_normal_version: bool,
     row_id_column_name: str = "Row ID",
     as_of: Optional[dt.date] = None,
+    password: Optional[str] = None,
+    include_sheets: Optional[List[str]] = None,
 ) -> RunResult:
     """
     Scramble all worksheet tabs in an XLSX file.
@@ -475,6 +678,8 @@ def scramble_xlsx_file(
     - Row 1 on each worksheet is headers; column rules apply by header name across sheets.
     - Output is values-only (no styles/tables/filters).
     """
+    import zipfile
+
     try:
         import openpyxl  # type: ignore
     except Exception as e:
@@ -483,9 +688,33 @@ def scramble_xlsx_file(
     as_of = as_of or dt.date.today()
     seed = secrets.token_bytes(32)  # GUI mode: no seed exposure
 
-    wb = openpyxl.load_workbook(input_path, data_only=True)
+    try:
+        if password is not None:
+            wb = openpyxl.load_workbook(_decrypt_xlsx(input_path, password), data_only=True)
+        else:
+            wb = openpyxl.load_workbook(input_path, data_only=True)
+    except zipfile.BadZipFile as e:
+        raise EncryptedXlsxError(
+            "This file is password-protected. Select it again and enter the password when prompted."
+        ) from e
     if not wb.worksheets:
         raise ValueError("This Excel file has no worksheets.")
+
+    all_sheet_titles = [ws.title for ws in wb.worksheets]
+    if include_sheets is not None:
+        unknown = set(include_sheets) - set(all_sheet_titles)
+        if unknown:
+            raise ValueError(f"Unknown sheet name(s) in include_sheets: {sorted(unknown)!r}")
+        if len(include_sheets) == 0:
+            raise ValueError("include_sheets cannot be empty.")
+
+    sheets_export_count = len(include_sheets) if include_sheets is not None else len(all_sheet_titles)
+    out_ext = os.path.splitext(output_scrambled_path)[1].lower()
+    if out_ext == ".csv" and sheets_export_count > 1:
+        raise ValueError(
+            "Cannot save a multi-sheet Excel workbook as a CSV file. "
+            "Choose an output path ending in .xlsx, or save each sheet separately outside this tool."
+        )
 
     keyed_original_path: Optional[str] = None
     if create_keyed_normal_version:
@@ -503,14 +732,20 @@ def scramble_xlsx_file(
         orig_wb.remove(orig_wb.active)
 
     total_row_count = 0
+    skipped_cf_rules: List[str] = []
+
+    # Pre-scan all sheets so cross-sheet formula references can be row-shifted correctly.
+    hdr_row_by_sheet: Dict[str, int] = {ws.title: _xlsx_header_row(ws) for ws in wb.worksheets}
 
     for ws in wb.worksheets:
+        if include_sheets is not None and ws.title not in include_sheets:
+            continue
         max_col = ws.max_column or 0
         hdr_row = _xlsx_header_row(ws)
         headers: List[str] = []
         for c in range(1, max_col + 1):
             v = ws.cell(row=hdr_row, column=c).value
-            headers.append("" if v is None else str(v))
+            headers.append("" if (v is None or _is_excel_error(v)) else str(v))
 
         _validate_unique_headers(headers, sheet_name=ws.title)
 
@@ -540,46 +775,115 @@ def scramble_xlsx_file(
             try:
                 new_vals = make_shuffle_derangement(vals)
             except ShuffleValuesError as e:
-                raise ShuffleValuesError(f"Sheet {ws.title!r} / {h}: {e}") from e
+                raise ShuffleValuesError(
+                    f"Sheet {ws.title!r} / {h}: {e}",
+                    column_key=f"{h} ({ws.title})",
+                ) from e
             shuffled_assignment[h] = {row_idxs[i]: new_vals[i] for i in range(len(row_idxs))}
 
         out_ws = out_wb.create_sheet(title=ws.title)
         out_ws.cell(row=1, column=1).value = row_id_column_name
+        _copy_cell_static_style(ws.cell(row=hdr_row, column=1), out_ws.cell(row=1, column=1))
         for i, h in enumerate(headers, start=2):
-            out_ws.cell(row=1, column=i).value = h
+            out_cell = out_ws.cell(row=1, column=i)
+            out_cell.value = h
+            _copy_cell_static_style(ws.cell(row=hdr_row, column=i - 1), out_cell)
 
         orig_ws = None
         if orig_wb is not None:
             orig_ws = orig_wb.create_sheet(title=ws.title)
             orig_ws.cell(row=1, column=1).value = row_id_column_name
+            _copy_cell_static_style(ws.cell(row=hdr_row, column=1), orig_ws.cell(row=1, column=1))
             for i, h in enumerate(headers, start=2):
-                orig_ws.cell(row=1, column=i).value = h
+                oc = orig_ws.cell(row=1, column=i)
+                oc.value = h
+                _copy_cell_static_style(ws.cell(row=hdr_row, column=i - 1), oc)
 
         for r_idx in range(hdr_row + 1, max_row + 1):
             row0 = r_idx - hdr_row - 1
             out_r = row0 + 2  # output row: row 1 is headers, data starts at row 2
             out_ws.cell(row=out_r, column=1).value = row_ids[row0]
+            _copy_cell_static_style(ws.cell(row=r_idx, column=1), out_ws.cell(row=out_r, column=1))
             if orig_ws is not None:
-                orig_ws.cell(row=out_r, column=1).value = row_ids[row0]
+                oc_rid = orig_ws.cell(row=out_r, column=1)
+                oc_rid.value = row_ids[row0]
+                _copy_cell_static_style(ws.cell(row=r_idx, column=1), oc_rid)
 
             for c in range(1, max_col + 1):
                 header = headers[c - 1]
                 mode = header_modes.get(f"{header} ({ws.title})", default_mode_for_header(header))
                 val = ws.cell(row=r_idx, column=c).value
                 s = "" if val is None else str(val)
+                src_cell = ws.cell(row=r_idx, column=c)
+                dst_out = out_ws.cell(row=out_r, column=c + 1)
 
                 if orig_ws is not None:
-                    orig_ws.cell(row=out_r, column=c + 1).value = s
+                    oc = orig_ws.cell(row=out_r, column=c + 1)
+                    oc.value = s
+                    _copy_cell_static_style(src_cell, oc)
 
                 if mode == "shuffle values":
                     if s.strip() == "":
-                        out_ws.cell(row=out_r, column=c + 1).value = s
+                        dst_out.value = s
                     else:
-                        out_ws.cell(row=out_r, column=c + 1).value = shuffled_assignment[header].get(row0, s)
+                        dst_out.value = shuffled_assignment[header].get(row0, s)
+                    _copy_cell_static_style(src_cell, dst_out)
                     continue
 
                 col = ColumnContext(header=header, mode=mode)
-                out_ws.cell(row=out_r, column=c + 1).value = scramble_cell(seed=seed, value=s, col=col, as_of=as_of)
+                dst_out.value = scramble_cell(seed=seed, value=s, col=col, as_of=as_of)
+                _copy_cell_static_style(src_cell, dst_out)
+
+        # PIPELINE STEP 3B: Copy conditional formatting from source sheet, adjusting
+        # all cell coordinates to match the output layout (Row ID column +1, hdr_row offset).
+        col_delta = 1  # Row ID prepended at column A
+        local_row_delta = 1 - hdr_row  # normalise source rows to 1-based output rows
+
+        for cf in ws.conditional_formatting:
+            try:
+                new_sqref = _shift_sqref(str(cf.sqref), col_delta, local_row_delta)
+            except Exception:
+                skipped_cf_rules.append(
+                    f"Sheet '{ws.title}' / sqref {cf.sqref}: could not shift sqref"
+                )
+                continue
+
+            adjusted_rules: List[object] = []
+            skip_this_cf = False
+
+            for rule in cf.rules:
+                adjusted_rule = copy.deepcopy(rule)
+                if getattr(adjusted_rule, "formula", None):
+                    new_formulas = []
+                    for f_str in adjusted_rule.formula:
+                        shifted = _shift_formula(f_str, col_delta, local_row_delta, hdr_row_by_sheet)
+                        if shifted is None:
+                            skipped_cf_rules.append(
+                                f"Sheet '{ws.title}' / sqref {cf.sqref}: "
+                                f"skipped rule containing INDIRECT(), external reference, or named range"
+                            )
+                            skip_this_cf = True
+                            break
+                        new_formulas.append(shifted)
+                    if skip_this_cf:
+                        break
+                    adjusted_rule.formula = new_formulas
+                adjusted_rules.append(adjusted_rule)
+
+            if not skip_this_cf:
+                for adjusted_rule in adjusted_rules:
+                    try:
+                        out_ws.conditional_formatting.add(new_sqref, adjusted_rule)  # type: ignore[arg-type]
+                    except Exception as exc:
+                        skipped_cf_rules.append(
+                            f"Sheet '{ws.title}' / sqref {cf.sqref}: could not apply rule ({exc})"
+                        )
+                if orig_ws is not None:
+                    for adjusted_rule in adjusted_rules:
+                        try:
+                            orig_ws.conditional_formatting.add(new_sqref, copy.deepcopy(adjusted_rule))  # type: ignore[arg-type]
+                        except Exception:
+                            pass  # best-effort for keyed original
 
     out_wb.save(output_scrambled_path)
     if orig_wb is not None and keyed_original_path is not None:
@@ -589,6 +893,7 @@ def scramble_xlsx_file(
         scrambled_output_path=output_scrambled_path,
         keyed_original_output_path=keyed_original_path,
         row_count=total_row_count,
+        warnings=skipped_cf_rules,
     )
 
 
@@ -601,6 +906,8 @@ def scramble_tabular_file(
     row_id_column_name: str = "Row ID",
     encoding: str = "utf-8",
     as_of: Optional[dt.date] = None,
+    password: Optional[str] = None,
+    include_sheets: Optional[List[str]] = None,
 ) -> RunResult:
     # PIPELINE STEP 0: Pick the correct pipeline based on file extension.
     ext = os.path.splitext(input_path)[1].lower()
@@ -622,12 +929,14 @@ def scramble_tabular_file(
             create_keyed_normal_version=create_keyed_normal_version,
             row_id_column_name=row_id_column_name,
             as_of=as_of,
+            password=password,
+            include_sheets=include_sheets,
         )
     raise ValueError(f"Unsupported input type: {ext}. Please use .csv or .xlsx")
 
 
 # COMMON EDITS (for maintainers)
-# - Change default dropdown behavior: edit default_mode_for_header().
+# - Change default dropdown behavior (CLI / pipeline fallback): edit default_mode_for_column().
 # - Add/adjust date formats: edit ISO_DATE_RE / US_DATE_RE / TIME_RE and placeholder logic.
 # - Add more file types: extend scramble_tabular_file() and add a new pipeline function.
 

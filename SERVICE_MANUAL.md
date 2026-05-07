@@ -47,7 +47,10 @@ The portable executable is created at:
 - **CSV + XLSX support**:
   - CSV processing uses Python’s `csv` module.
   - Excel processing uses `openpyxl` (pinned in `requirements.txt`).
-- **Excel output is values-only**: we write a brand-new workbook so filters/formatting/formulas are not preserved (by design).
+  - Password-protected `.xlsx` files are supported via `msoffcrypto-tool` (also pinned). Decryption is done in-memory; no unencrypted temp file is written to disk. The output file is never re-encrypted.
+- **Excel output is values-first** (plus formatting): we write a brand-new workbook with scrambled values. **Static cell styling** (fill/background, font, border, alignment, number format) is copied from each source cell to the matching output cell (including the prepended Row ID column, aligned with column A of the source). **Conditional formatting** rules are also copied sheet-by-sheet (see below). Formulas and filters are not preserved.
+  - All conditional formatting rules are copied from each source sheet to the corresponding output sheet, with column and row coordinates adjusted to account for the prepended Row ID column and any preamble rows.
+  - Rules that cannot be safely adjusted (those containing `INDIRECT()`, external workbook references, or named ranges) are skipped; the output will still save and the skipped rules are listed in the completion message.
 - **Per-column dropdown modes**: the GUI exposes the rules directly so staff can keep particular columns stable for error-checking.
 
 ---
@@ -60,9 +63,11 @@ This app is organized as a simple pipeline. If you get stuck, open the files bel
 
 - **PIPELINE STEP 0**: build the UI (buttons, header list, dropdowns)
 - **PIPELINE STEP 1**: user chooses input file + output location
-- **PIPELINE STEP 2**: app reads headers and shows grouped columns with dropdowns (defaults come from core)
-- **PIPELINE STEP 3**: user clicks Run; app collects dropdown selections
-- **PIPELINE STEP 4**: app calls the core pipeline and then shows success/error messages
+- **PIPELINE STEP 2**: app reads headers, scans an initial portion of the data (for date detection and **sample previews**—up to three unique values per column), and shows grouped columns with dropdowns (**defaults to “no scramble” per column** unless changed). For **Excel files with more than one worksheet**, columns are grouped **by worksheet** first, then by category (date / program-project / other); CSV and single-sheet Excel use a single flat category list.
+- **PIPELINE STEP 3**: user clicks Run; for **multi-sheet Excel** files a **sheet picker** opens (checkboxes per tab); optional warning if conditional formatting on included sheets references excluded tabs; then the column list refreshes to show only selected sheets; app collects dropdown selections
+- **PIPELINE STEP 4**: app calls the core pipeline (`include_sheets` when a subset was chosen) and shows success/error messages
+
+Sample values shown under each column name are taken from this initial scan only (bounded row count per file or worksheet); they may not include every distinct value in very large files.
 
 Where to look:
 - version label: `APP_VERSION`
@@ -77,13 +82,14 @@ Where to look:
   - **PIPELINE STEP 2**: compute “shuffle values” reassignment
   - **PIPELINE STEP 3**: second pass writes scrambled output + optional keyed original
 - **Excel path** (`scramble_xlsx_file`)
-  - **PIPELINE STEP 1**: load workbook + read header row on **each worksheet** (`wb.worksheets`; chart-only tabs are skipped by openpyxl)
+  - **PIPELINE STEP 1**: load workbook + read header row on **each worksheet** (`wb.worksheets`; chart-only tabs are skipped by openpyxl); optional **`include_sheets`** limits which tabs are written to the output
   - **PIPELINE STEP 2**: collect shuffle info **per sheet** (non-blank only)
-  - **PIPELINE STEP 3**: write brand-new values-only workbook with **one tab per worksheet** (filters removed)
+  - **PIPELINE STEP 3A**: write brand-new workbook with **one tab per worksheet**; copy static cell styles from source (fill, font, border, alignment); formulas not preserved
+  - **PIPELINE STEP 3B**: copy conditional formatting rules from each source sheet, shifting all cell references by +1 column (Row ID) and adjusting rows for any preamble offset; rules using `INDIRECT()`, external workbook refs, or named ranges are skipped with a warning
 
 Where the rules live:
 - dropdown semantics: `scramble_cell()`
-- default dropdown selection: `default_mode_for_header()`
+- default dropdown selection: `default_mode_for_column()`
 - date parsing regexes: `ISO_DATE_RE`, `US_DATE_RE`, `TIME_RE`
 
 ---
@@ -130,12 +136,11 @@ When scrambling letters/digits:
 - **Case is preserved** (uppercase stays uppercase).
 - Hyphens remain in the same place (because punctuation is preserved).
 
-### Program/Project stability rule (default behavior)
+### Program/Project and date-detected fields (UI grouping)
 
-Default dropdown selection uses this rule:
-- If a header contains **`Program`** or **`Project`** and does **not** contain `Date`, default is **No scramble**.
-
-(Users can still override the dropdown.)
+- The GUI **groups** columns into *Date fields*, *Program/Project fields*, and *Other fields* for readability.
+- **Default for every column’s dropdown in the desktop app is No scramble**; users opt in to Full / Date / Shuffle / Delete per column. (The command-line `scramble_csv.py` still uses `default_mode_for_column()` for its defaults: Program/Project → no scramble, date-detected → date scramble, else full scramble.)
+- Columns detected as date-like from sampled data still show the *(date rules available)* hint.
 
 ### DOB/age bucket preservation rule
 
@@ -183,6 +188,8 @@ Excel files must be formatted like this:
 Output is:
 - a new `.xlsx` with **values only** and the **same worksheet tabs** as the input (data sheets only)
 - filters are effectively removed because the output workbook is newly created
+
+If the workbook has **more than one worksheet**, you **cannot** choose a `.csv` output path (CSV holds only one table). Use `.xlsx` or export sheets individually elsewhere first.
 
 ---
 
@@ -233,6 +240,13 @@ If the build gets stuck due to locks:
 ### “Unsupported file type”
 - The app supports `.csv` and `.xlsx`.
 
+### “Cannot save a multi-sheet Excel workbook as a CSV file”
+- You chose a `.csv` output path while the input Excel file has **more than one worksheet**. Pick an output path ending in `.xlsx`, or split/export sheets outside this tool first.
+
+### “Wrong password or corrupt file”
+- The password entered when opening a password-protected Excel file was incorrect, or the file is not a valid encrypted `.xlsx`.
+- Re-select the file and enter the correct password.
+
 ### “Duplicate headers not supported”
 - On a CSV: two columns share the same header name.
 - On Excel: the message may name the **sheet** (e.g. `Sheet 'Clients'`) when two columns on that tab share a name.
@@ -240,6 +254,7 @@ If the build gets stuck due to locks:
 
 ### “Shuffle values error”
 - The message names the **sheet** and **column** when the input is Excel (shuffle is evaluated per sheet).
+- In the desktop app, the column list **scrolls** so that column is centered when possible.
 - Common fixes:
   - Don’t use Shuffle on a column where all rows are the same **on that sheet**, or where only one row has a value
   - Or use Full/Date scramble instead
@@ -259,12 +274,13 @@ If the build gets stuck due to locks:
 - Rebuild the EXE
 
 ### Change default dropdowns
-- Edit `default_mode_for_header()` in `scrambler_core.py`
+- **GUI app:** initial mode for each combobox in `csv_scrambler_app.py` (`_render_header_controls`, and the `run()` fallback when a mode is missing).
+- **CLI / core fallbacks:** `default_mode_for_column()` in `scrambler_core.py`
 
 ### Add more date formats
 - Add regex patterns near `ISO_DATE_RE` / `US_DATE_RE` in `scrambler_core.py`
 - Update placeholder replacement logic in `_replace_protected_substrings_with_placeholders()`
 
 ### Change Excel sheet/header assumptions
-- Multi-sheet behavior is implemented in `scramble_xlsx_file()` in `scrambler_core.py`; GUI header union lives in `_try_read_headers()` in `csv_scrambler_app.py`.
+- Multi-sheet behavior is implemented in `scramble_xlsx_file()` (`include_sheets`) in `scrambler_core.py`; the GUI sheet picker and header union live in `csv_scrambler_app.py`.
 

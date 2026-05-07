@@ -5,12 +5,13 @@ import secrets
 import sys
 import argparse
 import csv
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 from scrambler_core import (
     ColumnContext,
     ScrambleMode,
-    default_mode_for_header,
+    _col_looks_like_dates,
+    default_mode_for_column,
     is_program_project_stable_header,
     scramble_cell,
 )
@@ -91,6 +92,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
 
+    _SAMPLE_ROWS = 20
+
     with open(in_path, "r", encoding=args.encoding, newline="") as f_in, open(
         out_path, "w", encoding=args.encoding, newline=""
     ) as f_out:
@@ -104,19 +107,27 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         writer.writerow(headers)
 
-        # CLI behavior: keep your original business rules as defaults.
-        # - Program/Project (unless Date) stays stable
-        # - DOB-like uses date rules
-        # - Other date/time uses date rules
-        header_modes = {h: default_mode_for_header(h) for h in headers}
-
+        # Pass 1: sample up to _SAMPLE_ROWS non-blank values per column to detect date columns.
+        col_samples: Dict[int, List[str]] = {i: [] for i in range(len(headers))}
+        data_rows: List[List[str]] = []
         for row in reader:
+            data_rows.append(row)
+            for i, val in enumerate(row):
+                if i < len(headers) and val.strip() and len(col_samples[i]) < _SAMPLE_ROWS:
+                    col_samples[i].append(val)
+
+        detected_date_keys: Set[str] = {
+            headers[i] for i, slist in col_samples.items() if _col_looks_like_dates(slist)
+        }
+        header_modes = {h: default_mode_for_column(h, is_date=h in detected_date_keys) for h in headers}
+
+        # Pass 2: write scrambled output using the buffered rows.
+        for row in data_rows:
             if len(row) < len(headers):
                 row = row + [""] * (len(headers) - len(row))
             new_row: List[str] = []
             for idx, header in enumerate(headers):
                 mode: ScrambleMode = header_modes[header]
-                # Preserve historical CLI rule: stable program/project columns remain unchanged.
                 if is_program_project_stable_header(header):
                     new_row.append(row[idx])
                     continue

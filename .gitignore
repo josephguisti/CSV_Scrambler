@@ -10,7 +10,9 @@ dist/
 # Data files (may contain PII)
 *.csv
 *.xlsx
-*.txt
+
+# Output text files
+*Output*.txt
 
 # Word docs
 *.docx
