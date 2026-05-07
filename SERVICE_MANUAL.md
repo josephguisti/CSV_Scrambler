@@ -218,7 +218,7 @@ The build script:
 - runs PyInstaller to bundle:
   - `csv_scrambler_app.py` (the GUI entrypoint)
   - `scrambler_core.py` (the rule/pipeline engine)
-  - Python + Tkinter + `openpyxl` into one portable `.exe`
+  - Python + Tkinter + `openpyxl` + `msoffcrypto-tool` (encrypted `.xlsx`) into one portable `.exe` (`--collect-all msoffcrypto` so decryption submodules are not omitted; openpyxl uses PyInstaller’s hook—avoid `--collect-all openpyxl`, which unnecessarily bundles pandas)
 
 ### Why we don’t use `--clean`
 

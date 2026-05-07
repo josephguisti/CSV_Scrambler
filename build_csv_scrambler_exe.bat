@@ -18,10 +18,13 @@ python -m pip install --upgrade pip >nul
 python -m pip install -r requirements.txt
 python -m pip install -r requirements-dev.txt
 
+REM --collect-all msoffcrypto: encrypted .xlsx decryption pulls submodules PyInstaller can miss.
+REM openpyxl is covered by PyInstaller's standard hook (avoid --collect-all openpyxl: it drags pandas/numpy).
 python -m PyInstaller ^
   --onefile ^
   --noconsole ^
   --name "CSV Scrambler" ^
+  --collect-all msoffcrypto ^
   csv_scrambler_app.py
 
 echo.
