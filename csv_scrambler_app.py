@@ -683,6 +683,27 @@ class App(tk.Tk):
             )
             return
 
+        # Pre-flight: verify the output file (and keyed original if requested) is not locked
+        # by Excel, OneDrive, or another process. Check now so the user isn't left waiting
+        # through a long scramble only to get a PermissionError on save.
+        paths_to_check: List[str] = [self.output_path or ""]
+        if bool(self.keyed_var.get()) and self.output_path:
+            base, ext = os.path.splitext(self.output_path)
+            paths_to_check.append(f"{base} (KEYED ORIGINAL){ext or '.xlsx'}")
+        for _check_path in paths_to_check:
+            if _check_path and os.path.exists(_check_path):
+                try:
+                    with open(_check_path, "ab"):
+                        pass
+                except PermissionError:
+                    messagebox.showerror(
+                        "Output file is open",
+                        f"Cannot write to:\n{_check_path}\n\n"
+                        "The file is open in another program (Excel, OneDrive sync, etc.).\n\n"
+                        "Close the file and try again.",
+                    )
+                    return
+
         hdr_for_modes = self._filtered_headers()
         if not hdr_for_modes:
             messagebox.showinfo("No columns", "There are no columns to scramble for the current selection.")
