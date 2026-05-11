@@ -757,16 +757,27 @@ def scramble_xlsx_file(
         shuffle_headers = [h for h in headers if header_modes.get(f"{h} ({ws.title})") == "shuffle values"]
         shuffle_values_by_header: Dict[str, List[Tuple[int, str]]] = {h: [] for h in shuffle_headers}
 
-        header_to_colnum = {h: i + 1 for i, h in enumerate(headers)}
-        for r_idx in range(hdr_row + 1, max_row + 1):
-            row0 = r_idx - hdr_row - 1
-            for h in shuffle_headers:
-                cnum = header_to_colnum[h]
-                val = ws.cell(row=r_idx, column=cnum).value
-                s = "" if val is None else str(val)
-                if s.strip() == "":
-                    continue
-                shuffle_values_by_header[h].append((row0, s))
+        # Pre-compute per-column mode and ColumnContext (avoids repeated dict lookups inside row loop).
+        col_modes: List[ScrambleMode] = [
+            header_modes.get(f"{h} ({ws.title})", default_mode_for_header(h))
+            for h in headers
+        ]
+        col_contexts: List[ColumnContext] = [
+            ColumnContext(header=h, mode=m)
+            for h, m in zip(headers, col_modes)
+        ]
+
+        # Shuffle pre-pass: use iter_rows for fast batch access.
+        if shuffle_headers:
+            shuffle_colidxs = {h: i for i, h in enumerate(headers) if h in set(shuffle_headers)}
+            for row_cells in ws.iter_rows(min_row=hdr_row + 1, max_row=max_row):
+                row0 = row_cells[0].row - hdr_row - 1
+                for h, ci in shuffle_colidxs.items():
+                    if ci < len(row_cells):
+                        val = row_cells[ci].value
+                        s = "" if val is None else str(val)
+                        if s.strip():
+                            shuffle_values_by_header[h].append((row0, s))
 
         shuffled_assignment: Dict[str, Dict[int, str]] = {}
         for h, pairs in shuffle_values_by_header.items():
@@ -799,39 +810,38 @@ def scramble_xlsx_file(
                 oc.value = h
                 _copy_cell_static_style(ws.cell(row=hdr_row, column=i - 1), oc)
 
-        for r_idx in range(hdr_row + 1, max_row + 1):
-            row0 = r_idx - hdr_row - 1
+        # Main data pass: use iter_rows so each cell object is fetched once.
+        for row_cells in ws.iter_rows(min_row=hdr_row + 1, max_row=max_row):
+            row0 = row_cells[0].row - hdr_row - 1
             out_r = row0 + 2  # output row: row 1 is headers, data starts at row 2
-            out_ws.cell(row=out_r, column=1).value = row_ids[row0]
-            _copy_cell_static_style(ws.cell(row=r_idx, column=1), out_ws.cell(row=out_r, column=1))
+
+            # Row ID column (copy style from first source cell in the row).
+            dst_rid = out_ws.cell(row=out_r, column=1)
+            dst_rid.value = row_ids[row0]
+            _copy_cell_static_style(row_cells[0], dst_rid)
             if orig_ws is not None:
                 oc_rid = orig_ws.cell(row=out_r, column=1)
                 oc_rid.value = row_ids[row0]
-                _copy_cell_static_style(ws.cell(row=r_idx, column=1), oc_rid)
+                _copy_cell_static_style(row_cells[0], oc_rid)
 
-            for c in range(1, max_col + 1):
-                header = headers[c - 1]
-                mode = header_modes.get(f"{header} ({ws.title})", default_mode_for_header(header))
-                val = ws.cell(row=r_idx, column=c).value
-                s = "" if val is None else str(val)
-                src_cell = ws.cell(row=r_idx, column=c)
-                dst_out = out_ws.cell(row=out_r, column=c + 1)
+            for c_idx in range(min(max_col, len(row_cells))):
+                src_cell = row_cells[c_idx]
+                header = headers[c_idx]
+                mode = col_modes[c_idx]
+                s = "" if src_cell.value is None else str(src_cell.value)
+                dst_out = out_ws.cell(row=out_r, column=c_idx + 2)
 
                 if orig_ws is not None:
-                    oc = orig_ws.cell(row=out_r, column=c + 1)
+                    oc = orig_ws.cell(row=out_r, column=c_idx + 2)
                     oc.value = s
                     _copy_cell_static_style(src_cell, oc)
 
                 if mode == "shuffle values":
-                    if s.strip() == "":
-                        dst_out.value = s
-                    else:
-                        dst_out.value = shuffled_assignment[header].get(row0, s)
+                    dst_out.value = s if s.strip() == "" else shuffled_assignment[header].get(row0, s)
                     _copy_cell_static_style(src_cell, dst_out)
                     continue
 
-                col = ColumnContext(header=header, mode=mode)
-                dst_out.value = scramble_cell(seed=seed, value=s, col=col, as_of=as_of)
+                dst_out.value = scramble_cell(seed=seed, value=s, col=col_contexts[c_idx], as_of=as_of)
                 _copy_cell_static_style(src_cell, dst_out)
 
         # PIPELINE STEP 3B: Copy conditional formatting from source sheet, adjusting
