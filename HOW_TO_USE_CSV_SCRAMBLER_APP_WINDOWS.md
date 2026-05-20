@@ -1,11 +1,11 @@
-# How to Use the CSV Scrambler App (Windows / PC Guide)
+# How to Use the CSV / Excel Scrambler App (Windows / PC Guide)
 
-This guide is for non-technical staff. It explains how to use the **CSV Scrambler app** (a double-click `.exe`) to remove PII before uploading data into AI-enabled tools.
+This guide is for non-technical staff. It explains how to use the **CSV Scrambler app** (a double-click `.exe`) to remove PII from CSV or Excel files before uploading data into AI-enabled tools.
 
 ## What you need
 
 - The app file: **`CSV Scrambler.exe`**
-- The CSV you want to scrub
+- The CSV or Excel file you want to scrub
 
 ## Step 1: Open the app
 
@@ -41,11 +41,15 @@ The app writes a **new Excel file** with scrambled values; static cell coloring 
 
 If you open a password-protected `.xlsx` file, the app will automatically prompt you for the password. Enter it and click OK. The password is used only to open the file — the output file will **not** be password-protected.
 
-## Step 3: Choose where the scrambled CSV will be saved
+## Step 3: Choose where the scrambled output will be saved
 
 Click **Choose Output…** and pick the **name and location** for the scrambled file.
 
 Tip: save it somewhere easy to find (like your Desktop) if you’re going to upload it right away.
+
+For Excel files:
+- Use `.xlsx` output when exporting more than one worksheet.
+- `.csv` output is allowed only when exporting one worksheet.
 
 ## Step 4: Review the column rules (dropdowns)
 
@@ -68,8 +72,8 @@ Each column has a dropdown showing how it will be handled:
 
 If you check **Create Keyed Normal Version**, the app will produce **two files**:
 
-- the **scrambled CSV**
-- a **keyed original CSV** (unchanged original values), both containing a `Row ID` column
+- the **scrambled output**
+- a **keyed original** file (unchanged original values), both containing a `Row ID` column
 
 This can be used to join the two files later if you need to recover the original values.
 
@@ -84,8 +88,9 @@ When it finishes, the app will show:
 ## Troubleshooting
 
 ### The output file won’t save
-- Close the CSV in Excel (Excel can lock the file).
+- Close the output file in Excel (Excel can lock the file).
 - Make sure you have permission to write to that folder.
+- If the app says the output file is open, close the named file and run the scramble again.
 
 ### "Wrong password or corrupt file"
 - The password you entered was incorrect, or the file is not a valid encrypted Excel file.

@@ -179,17 +179,20 @@ If **Create Keyed Normal Version** is checked:
 ## Excel (XLSX) support rules
 
 Excel files must be formatted like this:
-- **Row 1** on **every worksheet tab** contains headers (same rule as CSV: no duplicate header text within a single sheet)
-- The app builds a **union** of all column names across sheets; the column rules you set apply to **every** tab that has that column
+- Headers must be unique **within each worksheet tab**. The app detects the header row from AutoFilter first, then scans the first 20 rows for the first dense row (useful when exported workbooks have title rows above the headers).
+- The app lists Excel column rules as `Column Name (Sheet Name)`, so the same header on two sheets can have two different rules.
+- For workbooks with more than one worksheet, the app opens a **sheet picker** before export. After sheets are selected, the rule list refreshes to show only included worksheet tabs.
 - **Shuffle values** is computed **within each sheet** (not pooled across the whole file)
 - Chart-only tabs (not grid worksheets) are not included in `wb.worksheets` and are omitted from the output
 - Avoid merged cells / tables (filters are OK)
 
 Output is:
-- a new `.xlsx` with **values only** and the **same worksheet tabs** as the input (data sheets only)
+- a new `.xlsx` with **values only** and one tab per selected worksheet (data sheets only)
+- static cell styling copied where possible
+- conditional formatting copied where possible, with warnings when rules cannot be shifted safely
 - filters are effectively removed because the output workbook is newly created
 
-If the workbook has **more than one worksheet**, you **cannot** choose a `.csv` output path (CSV holds only one table). Use `.xlsx` or export sheets individually elsewhere first.
+If the export includes **more than one worksheet**, you **cannot** choose a `.csv` output path (CSV holds only one table). Use `.xlsx`, or choose a single sheet in the sheet picker.
 
 ---
 

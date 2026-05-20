@@ -1,99 +1,126 @@
-# CSV Scrambler (PII-safe for AI tools)
+# CSV / Excel Scrambler
 
-This folder contains small Python scripts to **scramble PII** in CSV files before importing them into AI-enabled tools.
+Privacy-oriented Windows tool for creating PII-safe copies of CSV and Excel files before sharing data with AI-enabled tools. The desktop app reads a source file, lets the user choose a rule for each column, and writes new output files without editing the original.
 
-## Scripts
+Current desktop app version: **1.12.0**
 
-### `scramble_csv.py`
-Scrambles **letters and digits** in all columns, with two special behaviors:
+## Recommended Download / Use
 
-- **Dates**: any date-like substring stays in the **same month and year**, but the **day is scrambled**.
-  - Supports formats like `M/D/YYYY` and `YYYY-MM-DD` (including when directly followed by time, e.g. `2026-03-0310:40AM`).
-  - If a cell contains time, the **time portion is preserved** (only the date is changed).
-- **DOB-like columns**: for columns whose header contains `age`, `birth`, or `dob` (case-insensitive),
-  the scrambled day is chosen so the person remains in the same bucket **as-of today**:
-  - minor: < 18
-  - TAY: 18–24 inclusive
-  - adult: 25+
-- **Program/Project columns stay stable**: if a column header contains `Program` **or** `Project` but does **not** contain `Date`,
-  the entire column is left unchanged.
+For non-technical users, use the packaged Windows app:
 
-Usage:
+- App file: `dist\CSV Scrambler.exe`
+- End-user guide: `HOW_TO_USE_CSV_SCRAMBLER_APP_WINDOWS.md`
+- Maintainer/service guide: `SERVICE_MANUAL.md`
 
-```bash
-python scramble_csv.py --input "Critical Incident Report Pre-Scramble.csv" --output "Critical Incident Report Scrambled.csv"
-```
-
-Easiest (opens file picker windows if you omit `--input` and `--output`):
-
-```bash
-python scramble_csv.py
-```
-
-Optional: provide a seed for repeatable output:
-
-```bash
-python scramble_csv.py --input in.csv --output out.csv --seed "my-fixed-seed"
-```
-
-### `csv_scrambler_app.py` (GUI)
-This is the **GUI app** version (no Terminal needed once packaged).
-
-To run from Python (for developers):
+To run from source:
 
 ```bash
 python csv_scrambler_app.py
 ```
 
-To build a portable Windows `.exe`:
-- Run `build_csv_scrambler_exe.bat`
-- The output will be `dist\\CSV Scrambler.exe`
-
-Excel support:
-- The GUI app supports **`.xlsx`** with **multiple worksheet tabs**: row 1 on each tab is headers; column rules apply by header name across all tabs.
-- **Shuffle values** runs **within each sheet** separately.
-- Chart-only tabs are omitted from input/output (openpyxl).
-- Output is **values-only** and filters are removed.
-
-### `age_bucket_report.py` (accessory)
-Reports minor/TAY/adult counts for DOB-like columns (headers containing `age`, `birth`, or `dob`), **as-of today**.
-You can also compare two CSVs (e.g., original vs scrambled) to confirm counts match.
+To rebuild the portable Windows `.exe`:
 
 ```bash
-python age_bucket_report.py --input "Critical Incident Report Pre-Scramble.csv"
-python age_bucket_report.py --input "Critical Incident Report Pre-Scramble.csv" --compare "Critical Incident Report Scrambled.csv"
+build_csv_scrambler_exe.bat
+```
+
+The build output is `dist\CSV Scrambler.exe`.
+
+## What The Desktop App Supports
+
+- Input files: `.csv` and `.xlsx`
+- Password-protected `.xlsx` files, using in-memory decryption
+- Multi-sheet Excel workbooks with a sheet picker before export
+- Header-row detection for Excel using AutoFilter first, then a density scan
+- Per-column rules with sample values shown in the UI
+- Optional keyed original output with matching `Row ID` values
+- Static Excel cell styling copied where possible
+- Conditional formatting copied where possible, with warnings for rules that cannot be shifted safely
+- Pre-flight warning when the selected output file is already open or locked
+
+The app always writes new output files. It does not modify the source file in place.
+
+## Column Rules
+
+Every column starts as **No scramble** in the desktop app. Users opt in to one of these modes:
+
+- **Full scramble**: scrambles letters and digits everywhere in the cell, including dates and times.
+- **Date scramble**: preserves recognized date/time structure while changing date days and scrambling other letters/digits.
+- **Shuffle values**: reassigns non-blank values within the same column so each non-blank row gets a different value.
+- **No scramble**: leaves values unchanged.
+- **Delete data**: blanks cell values while keeping the column.
+
+Date scramble recognizes `M/D/YYYY` and `YYYY-MM-DD`. Time-of-day strings such as `10:40AM` or `22:12` are preserved. Date scrambling keeps the same month and year and preserves minor/TAY/adult age buckets as of the run date.
+
+## Excel Notes
+
+- Excel output is values-first: formulas are written as their loaded values, not preserved as formulas.
+- For multi-sheet workbooks, rules are keyed as `Column Name (Sheet Name)` so the same column name on different sheets can have different rules.
+- Shuffle values runs within each sheet, not across the entire workbook.
+- Chart-only tabs are skipped because they are not grid worksheets.
+- If exporting more than one worksheet, choose `.xlsx` output. CSV output is only valid when exporting a single sheet.
+- Password-protected input can be opened, but output files are not re-encrypted.
+
+## Developer / Script Entry Points
+
+### `csv_scrambler_app.py`
+
+Tkinter desktop app entry point. This is what gets packaged into the Windows `.exe`.
+
+### `scrambler_core.py`
+
+Shared business logic for CSV/Excel reading, column modes, date handling, shuffle handling, keyed output, and Excel formatting behavior.
+
+### `scramble_csv.py`
+
+CSV-only command-line tool. Unlike the desktop app, it uses automatic defaults:
+
+- Program/Project columns stay unchanged unless the header also contains Date.
+- Date-like columns use date scramble.
+- Other columns use full scramble.
+
+Usage:
+
+```bash
+python scramble_csv.py --input "input.csv" --output "output.csv"
+```
+
+Optional deterministic seed:
+
+```bash
+python scramble_csv.py --input "input.csv" --output "output.csv" --seed "my-fixed-seed"
+```
+
+### `age_bucket_report.py`
+
+Reports minor/TAY/adult counts for DOB-like CSV columns and can compare an original CSV to a scrambled CSV.
+
+```bash
+python age_bucket_report.py --input "input.csv" --compare "output.csv"
 ```
 
 ### `format_critical_incidents_for_email.py`
-Formats an exported Microsoft List CSV (Critical Incident Reports) into **email-ready text**.
-It uses the header row from `Critical Incident Report Pre-Scramble.csv` as the **canonical schema and field order**.
 
-Default behavior:
-- Outputs one incident per row
-- Prints each field as:
-  - `COLUMN HEADER:` then the value on the next line
-- Inserts `----------` between incidents
-- Handles quoted multi-line cells (keeps newlines; indents continuation lines)
-
-Non-technical usage (recommended): run it and use the file picker + Save As dialogs:
-
-```bash
-python format_critical_incidents_for_email.py
-```
-
-Power-user usage (explicit paths):
+Formats an exported Microsoft List CSV into email-ready text for Critical Incident workflows.
 
 ```bash
 python format_critical_incidents_for_email.py --input "Critical Incident Report Pre-Scramble.csv" --output "Critical Incident Email Output.txt"
 ```
 
-Optional flags:
+Useful flags:
+
 - `--skip-empty-fields`: omit blank fields
 - `--strict-schema`: error if the CSV is missing expected columns
 - `--include-extras`: include extra columns not in the canonical schema
-- `--stdout`: print output to the terminal instead of saving a .txt file
+- `--stdout`: print output to the terminal instead of saving a `.txt` file
 
-## Notes
-- The scripts use only the Python standard library (no dependencies).
-- `scramble_csv.py` prints the **seed** it used so you can reproduce the same scramble later.
+## Dependencies
 
+Runtime dependencies are in `requirements.txt`:
+
+- `openpyxl`
+- `msoffcrypto-tool`
+
+Build dependencies are in `requirements-dev.txt`:
+
+- `pyinstaller`
