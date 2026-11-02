@@ -16,11 +16,17 @@ If Windows shows a security warning (“Windows protected your PC”):
 - Click **More info**
 - Click **Run anyway**
 
-## Step 2: Choose the file to scramble (CSV or Excel)
+## Step 2: Choose the files to scramble (CSV or Excel)
 
-Click **Choose File…** and pick the file you want to scrub.
+When the app opens, a file window appears. Select one file, or hold **Ctrl** and click to select more than one. You can open that window again with **Choose files…**.
 
-After you choose the file, you’ll see a list of all column headers with dropdowns.
+After you choose, you’ll see a list of column headers. Each additional file is stacked below the previous one. If an Excel file has more than one worksheet, those sheets are stacked inside that file.
+
+Each column has a circle on the left. Select **one** field that should keep the same scrambled values in every file and sheet. For example, if **Client ID** `AE38749` becomes `B8O9254`, every **Client ID** cell with `AE38749` becomes `B8O9254` in every selected file. The column name has to match exactly. `Client ID` does not match `ClientID`.
+
+Set that field to **Full scramble** or **Date scramble**. The circles for that same column name select together, and their dropdowns stay in step.
+
+If a file does not have that column, the app asks whether to continue. The shared values apply only where the column exists. You can still run one file without selecting a circle; it scrambles the way it did before.
 
 ### Excel requirements (important)
 
@@ -43,9 +49,11 @@ If you open a password-protected `.xlsx` file, the app will automatically prompt
 
 ## Step 3: Choose where the scrambled output will be saved
 
-Click **Choose Output…** and pick the **name and location** for the scrambled file.
+**One file:** click **Choose Output…** and pick the name and location for the scrambled file. If you skip this, the app saves `Name Scrambled` next to the source file.
 
-Tip: save it somewhere easy to find (like your Desktop) if you’re going to upload it right away.
+**More than one file:** each scrambled file is saved next to its source, named `Name Scrambled`. **Choose Output…** is turned off for that run.
+
+Tip: for a single file, save it somewhere easy to find (like your Desktop) if you’re going to upload it right away.
 
 For Excel files:
 - Use `.xlsx` output when exporting more than one worksheet.
@@ -81,9 +89,12 @@ This can be used to join the two files later if you need to recover the original
 
 Click **Run Scramble**.
 
+With more than one file, you must select the shared field before running. If that field is not **Full scramble** or **Date scramble**, the app stops and explains why.
+
 When it finishes, the app will show:
-- the path to the scrambled file
-- and (if enabled) the path to the keyed original file
+- the path to each scrambled file
+- and (if enabled) the path to each keyed original file
+- any selected file that did not contain the shared column
 
 ## Troubleshooting
 

@@ -512,6 +512,33 @@ def _xlsx_header_row(ws) -> int:  # type: ignore[no-untyped-def]
     return 1
 
 
+def _prepare_link(
+    link_header: Optional[str],
+    link_mode: Optional[ScrambleMode],
+    link_seed: Optional[bytes],
+) -> Tuple[Optional[str], Optional[ScrambleMode], Optional[bytes]]:
+    """Normalize the optional cross-file field.
+
+    An empty header means this file run has no shared field. When a header is
+    set, the same mode and seed must be used so one original value always
+    becomes the same scrambled value.
+    """
+    if link_header is None or link_header == "":
+        return None, None, None
+    if link_mode is None or link_seed is None:
+        raise ValueError("link_header requires link_mode and link_seed.")
+    if link_mode not in ("full scramble", "date scramble"):
+        raise ValueError(
+            "The shared field must use full scramble or date scramble, "
+            f"not {link_mode!r}."
+        )
+    return link_header, link_mode, link_seed
+
+
+def _is_link_column(header: str, link_header: Optional[str]) -> bool:
+    return link_header is not None and header == link_header
+
+
 def scramble_csv_file(
     *,
     input_path: str,
@@ -521,6 +548,9 @@ def scramble_csv_file(
     row_id_column_name: str = "Row ID",
     encoding: str = "utf-8",
     as_of: Optional[dt.date] = None,
+    link_header: Optional[str] = None,
+    link_mode: Optional[ScrambleMode] = None,
+    link_seed: Optional[bytes] = None,
 ) -> RunResult:
     """
     Scramble CSV at input_path into output_scrambled_path, using per-header modes.
@@ -535,6 +565,7 @@ def scramble_csv_file(
     # - collect the values needed for any "shuffle values" columns
     as_of = as_of or dt.date.today()
     seed = secrets.token_bytes(32)  # GUI mode: no seed exposure
+    link_header, link_mode, link_seed = _prepare_link(link_header, link_mode, link_seed)
 
     # Pass 1: read headers and collect shuffle columns' values, plus row IDs.
     with open(input_path, "r", encoding=encoding, newline="") as f:
@@ -549,7 +580,12 @@ def scramble_csv_file(
 
         _validate_unique_headers(headers)
         header_to_idx = {h: i for i, h in enumerate(headers)}
-        shuffle_headers = [h for h in headers if header_modes.get(h) == "shuffle values"]
+        # The shared field uses link_mode, so it must not enter this file's shuffle.
+        shuffle_headers = [
+            h
+            for h in headers
+            if not _is_link_column(h, link_header) and header_modes.get(h) == "shuffle values"
+        ]
 
         shuffle_values_by_header: Dict[str, List[Tuple[int, str]]] = {h: [] for h in shuffle_headers}
         row_ids: List[str] = []
@@ -616,7 +652,13 @@ def scramble_csv_file(
                     row = row + [""] * (len(headers) - len(row))
                 new_row: List[str] = []
                 for col_i, header in enumerate(headers):
-                    mode = header_modes[header]
+                    if _is_link_column(header, link_header):
+                        assert link_mode is not None and link_seed is not None
+                        mode: ScrambleMode = link_mode
+                        use_seed = link_seed
+                    else:
+                        mode = header_modes[header]
+                        use_seed = seed
                     if mode == "shuffle values":
                         # blanks remain blank; non-blanks replaced from assignment
                         original_val = row[col_i] if col_i < len(row) else ""
@@ -627,7 +669,7 @@ def scramble_csv_file(
                         continue
 
                     col = ColumnContext(header=header, mode=mode)
-                    new_row.append(scramble_cell(seed=seed, value=row[col_i], col=col, as_of=as_of))
+                    new_row.append(scramble_cell(seed=use_seed, value=row[col_i], col=col, as_of=as_of))
 
                 writer_scr.writerow([row_ids[row_idx]] + new_row)
         finally:
@@ -669,6 +711,9 @@ def scramble_xlsx_file(
     as_of: Optional[dt.date] = None,
     password: Optional[str] = None,
     include_sheets: Optional[List[str]] = None,
+    link_header: Optional[str] = None,
+    link_mode: Optional[ScrambleMode] = None,
+    link_seed: Optional[bytes] = None,
 ) -> RunResult:
     """
     Scramble all worksheet tabs in an XLSX file.
@@ -687,6 +732,7 @@ def scramble_xlsx_file(
 
     as_of = as_of or dt.date.today()
     seed = secrets.token_bytes(32)  # GUI mode: no seed exposure
+    link_header, link_mode, link_seed = _prepare_link(link_header, link_mode, link_seed)
 
     try:
         if password is not None:
@@ -754,14 +800,26 @@ def scramble_xlsx_file(
         total_row_count += sheet_row_count
         row_ids = [str(uuid.uuid4()) for _ in range(sheet_row_count)]
 
-        shuffle_headers = [h for h in headers if header_modes.get(f"{h} ({ws.title})") == "shuffle values"]
+        shuffle_headers = [
+            h
+            for h in headers
+            if not _is_link_column(h, link_header)
+            and header_modes.get(f"{h} ({ws.title})") == "shuffle values"
+        ]
         shuffle_values_by_header: Dict[str, List[Tuple[int, str]]] = {h: [] for h in shuffle_headers}
 
         # Pre-compute per-column mode and ColumnContext (avoids repeated dict lookups inside row loop).
-        col_modes: List[ScrambleMode] = [
-            header_modes.get(f"{h} ({ws.title})", default_mode_for_header(h))
-            for h in headers
-        ]
+        # A linked column uses the shared mode and seed; the bare header keeps date scrambling stable.
+        col_modes: List[ScrambleMode] = []
+        col_seeds: List[bytes] = []
+        for h in headers:
+            if _is_link_column(h, link_header):
+                assert link_mode is not None and link_seed is not None
+                col_modes.append(link_mode)
+                col_seeds.append(link_seed)
+            else:
+                col_modes.append(header_modes.get(f"{h} ({ws.title})", default_mode_for_header(h)))
+                col_seeds.append(seed)
         col_contexts: List[ColumnContext] = [
             ColumnContext(header=h, mode=m)
             for h, m in zip(headers, col_modes)
@@ -841,7 +899,7 @@ def scramble_xlsx_file(
                     _copy_cell_static_style(src_cell, dst_out)
                     continue
 
-                dst_out.value = scramble_cell(seed=seed, value=s, col=col_contexts[c_idx], as_of=as_of)
+                dst_out.value = scramble_cell(seed=col_seeds[c_idx], value=s, col=col_contexts[c_idx], as_of=as_of)
                 _copy_cell_static_style(src_cell, dst_out)
 
         # PIPELINE STEP 3B: Copy conditional formatting from source sheet, adjusting
@@ -918,6 +976,9 @@ def scramble_tabular_file(
     as_of: Optional[dt.date] = None,
     password: Optional[str] = None,
     include_sheets: Optional[List[str]] = None,
+    link_header: Optional[str] = None,
+    link_mode: Optional[ScrambleMode] = None,
+    link_seed: Optional[bytes] = None,
 ) -> RunResult:
     # PIPELINE STEP 0: Pick the correct pipeline based on file extension.
     ext = os.path.splitext(input_path)[1].lower()
@@ -930,6 +991,9 @@ def scramble_tabular_file(
             row_id_column_name=row_id_column_name,
             encoding=encoding,
             as_of=as_of,
+            link_header=link_header,
+            link_mode=link_mode,
+            link_seed=link_seed,
         )
     if ext in [".xlsx", ".xlsm"]:
         return scramble_xlsx_file(
@@ -941,6 +1005,9 @@ def scramble_tabular_file(
             as_of=as_of,
             password=password,
             include_sheets=include_sheets,
+            link_header=link_header,
+            link_mode=link_mode,
+            link_seed=link_seed,
         )
     raise ValueError(f"Unsupported input type: {ext}. Please use .csv or .xlsx")
 

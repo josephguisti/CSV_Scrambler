@@ -2,7 +2,7 @@
 
 Privacy-oriented Windows tool for creating PII-safe copies of CSV and Excel files before sharing data with AI-enabled tools. The desktop app reads a source file, lets the user choose a rule for each column, and writes new output files without editing the original.
 
-Current desktop app version: **1.12.0**
+Current desktop app version: **1.13.0**
 
 ## Recommended Download / Use
 
@@ -28,7 +28,8 @@ The build output is `dist\CSV Scrambler.exe`.
 
 ## What The Desktop App Supports
 
-- Input files: `.csv` and `.xlsx`
+- Input files: `.csv` and `.xlsx`, including several files in one run (Ctrl+click in the file window that opens at startup)
+- One radio-selected column keeps the same scrambled values across every selected file and sheet. Other columns are scrambled separately in each file
 - Password-protected `.xlsx` files, using in-memory decryption
 - Multi-sheet Excel workbooks with a sheet picker before export
 - Header-row detection for Excel using AutoFilter first, then a density scan
@@ -56,6 +57,7 @@ Date scramble recognizes `M/D/YYYY` and `YYYY-MM-DD`. Time-of-day strings such a
 
 - Excel output is values-first: formulas are written as their loaded values, not preserved as formulas.
 - For multi-sheet workbooks, rules are keyed as `Column Name (Sheet Name)` so the same column name on different sheets can have different rules.
+- The radio-selected header is the exception: that column uses one scramble everywhere it appears. The match is the exact header text.
 - Shuffle values runs within each sheet, not across the entire workbook.
 - Chart-only tabs are skipped because they are not grid worksheets.
 - If exporting more than one worksheet, choose `.xlsx` output. CSV output is only valid when exporting a single sheet.

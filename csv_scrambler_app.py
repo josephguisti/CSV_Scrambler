@@ -9,10 +9,12 @@
 #
 import datetime as dt
 import os
+import secrets
 import threading
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from dataclasses import dataclass, field
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional, Set, Tuple
 
 from scrambler_core import (
@@ -32,7 +34,12 @@ from scrambler_core import (
 # VERSIONING
 # - Bump this when you ship a new build so staff can confirm they're running the right EXE.
 # - It is shown in the window title and in the top-right corner of the app.
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
+
+
+# Radios use the bare header as their value. This sentinel means nothing is selected.
+_NO_LINK = "\x00"
+_LINK_MODES = ("full scramble", "date scramble")
 
 
 MODES: List[ScrambleMode] = [
@@ -61,6 +68,51 @@ def _samples_preview_text(values: List[str]) -> str:
     if not values:
         return "no values"
     return "\n".join(_truncate_sample(v) for v in values)
+
+
+def _default_output_path(input_path: str) -> str:
+    stem, in_ext = os.path.splitext(os.path.basename(input_path))
+    out_ext = ".xlsx" if in_ext.lower() in (".xlsx", ".xlsm") else ".csv"
+    return os.path.join(os.path.dirname(input_path), f"{stem} Scrambled{out_ext}")
+
+
+def _bare_header(key: str, sheet_titles: List[str]) -> str:
+    """Column name with its known sheet suffix removed.
+
+    Matches the longest sheet title so a header that contains parentheses is kept intact.
+    """
+    best: Optional[str] = None
+    for title in sheet_titles:
+        suffix = f" ({title})"
+        if key.endswith(suffix) and (best is None or len(suffix) > len(best)):
+            best = suffix
+    if best:
+        return key[: -len(best)]
+    return key
+
+
+def _sheet_of_key(key: str, sheet_titles: List[str]) -> Optional[str]:
+    """Worksheet title encoded in an Excel column key, if any."""
+    bare = _bare_header(key, sheet_titles)
+    if bare == key:
+        return None
+    suffix = key[len(bare) :]
+    if suffix.startswith(" (") and suffix.endswith(")"):
+        return suffix[2:-1]
+    return None
+
+
+@dataclass
+class LoadedFile:
+    path: str
+    encoding: str
+    password: Optional[str]
+    sheet_titles: List[str]
+    headers: List[str]
+    detected_date_keys: Set[str]
+    sample_values: Dict[str, List[str]]
+    selected_sheets: Optional[List[str]] = None
+    mode_vars: Dict[str, tk.StringVar] = field(default_factory=dict)
 
 
 def _try_read_headers(path: str, password: Optional[str] = None) -> Tuple[List[str], str, List[str], Set[str], Dict[str, List[str]]]:
@@ -319,21 +371,15 @@ class App(tk.Tk):
         self.title(f"CSV Scrambler v{APP_VERSION}")
         self.geometry("900x700")
 
-        self.input_path: Optional[str] = None
+        self.files: List[LoadedFile] = []
         self.output_path: Optional[str] = None
-        self.encoding: str = "utf-8"
-        self.headers: List[str] = []
-        self.excel_sheet_titles: List[str] = []
-        self.detected_date_keys: Set[str] = set()
-        self.sample_values_by_header: Dict[str, List[str]] = {}
-        self.xlsx_password: Optional[str] = None
-        self.selected_sheets: Optional[List[str]] = None
+        self.link_header_var = tk.StringVar(value=_NO_LINK)
+        self._syncing_modes = False
 
-        self.mode_vars: Dict[str, tk.StringVar] = {}
-        self.column_row_frames: Dict[str, tk.Widget] = {}
+        self.column_row_frames: Dict[Tuple[str, str], tk.Widget] = {}
         self.keyed_var = tk.BooleanVar(value=False)
 
-        self.status_var = tk.StringVar(value="Choose a CSV or Excel file to begin.")
+        self.status_var = tk.StringVar(value="Choose CSV or Excel files to begin.")
 
         # PIPELINE STEP 0: Build the UI layout (buttons, header list, dropdowns).
         self._build_ui()
@@ -343,8 +389,10 @@ class App(tk.Tk):
         top = ttk.Frame(self, padding=12)
         top.pack(fill="x")
 
-        ttk.Button(top, text="Choose File…", command=self.choose_input).pack(side="left")
-        ttk.Button(top, text="Choose Output…", command=self.choose_output).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Choose files…", command=self.choose_files).pack(side="left")
+        self.output_button = ttk.Button(top, text="Choose Output…", command=self.choose_output)
+        self.output_button.pack(side="left", padx=(8, 0))
+        self._update_output_controls()
 
         self.input_label = ttk.Label(top, text="(no file selected)")
         self.input_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
@@ -387,6 +435,14 @@ class App(tk.Tk):
         self.sheet_hint_label = ttk.Label(mid, text="", foreground="#555", wraplength=820)
         self.sheet_hint_label.pack(anchor="w", pady=(4, 0))
 
+        self.link_hint_label = ttk.Label(
+            mid,
+            text="Select one field to keep the same scrambled values in every file and sheet.",
+            foreground="#333",
+            wraplength=820,
+        )
+        self.link_hint_label.pack(anchor="w", pady=(4, 0))
+
         self.scroll = ScrollFrame(mid)
         self.scroll.pack(fill="both", expand=True, pady=(8, 8))
 
@@ -397,10 +453,12 @@ class App(tk.Tk):
         ttk.Button(bottom, text="Run Scramble", command=self.run).pack(side="right")
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left", fill="x", expand=True)
 
-    def choose_input(self) -> None:
-        # PIPELINE STEP 1: User chooses the input file (.csv or .xlsx).
-        path = filedialog.askopenfilename(
-            title="Choose the file to scramble",
+    def choose_files(self) -> None:
+        # PIPELINE STEP 1: User chooses one or more input files (.csv or .xlsx).
+        # Ctrl+click and Shift+click work in the Windows file dialog.
+        paths = filedialog.askopenfilenames(
+            parent=self,
+            title="Choose files to scramble (Ctrl+click to select more than one)",
             filetypes=[
                 ("CSV or Excel files", "*.csv;*.xlsx"),
                 ("CSV files", "*.csv"),
@@ -408,77 +466,107 @@ class App(tk.Tk):
                 ("All files", "*.*"),
             ],
         )
-        if not path:
+        if not paths:
             return
-        self.input_path = path
-        self.xlsx_password = None  # reset whenever a new file is chosen
-        self.selected_sheets = None
-        self.input_label.config(text=os.path.basename(path))
 
+        loaded: List[LoadedFile] = []
+        failures: List[str] = []
+        for path in paths:
+            try:
+                loaded.append(self._load_file(path))
+            except Exception as e:
+                failures.append(f"{os.path.basename(path)}: {e}")
+
+        if not loaded:
+            messagebox.showerror(
+                "Could not read files",
+                "None of the selected files could be opened.\n\n" + "\n".join(failures),
+            )
+            return
+
+        if failures:
+            messagebox.showerror(
+                "Some files could not be opened",
+                "These files were skipped:\n\n" + "\n".join(failures),
+            )
+
+        self.files = loaded
+        self.link_header_var.set(_NO_LINK)
+        self.output_path = None
+        self._update_output_controls()
+        self.input_label.config(text=self._input_label_text())
+        self._render_header_controls()
+        if len(self.files) > 1:
+            self.status_var.set("Ready. Select the shared field, review column rules, then click Run Scramble.")
+        else:
+            self.status_var.set("Ready. Review column rules, then click Run Scramble.")
+
+    def _load_file(self, path: str) -> LoadedFile:
+        password: Optional[str] = None
         try:
             headers, enc, sheet_titles, detected_date_keys, sample_values = _try_read_headers(path)
         except EncryptedXlsxError:
-            from tkinter import simpledialog
             pw = simpledialog.askstring(
                 "Password Required",
                 f"{os.path.basename(path)} is password-protected.\nEnter the password:",
                 show="*",
+                parent=self,
             )
             if not pw:
-                return  # user cancelled
-            try:
-                headers, enc, sheet_titles, detected_date_keys, sample_values = _try_read_headers(path, password=pw)
-            except Exception as e:
-                messagebox.showerror("Wrong password or corrupt file", str(e))
-                return
-            self.xlsx_password = pw
-        except Exception as e:
-            messagebox.showerror("Could not read file", str(e))
-            return
+                raise ValueError("password was not entered")
+            headers, enc, sheet_titles, detected_date_keys, sample_values = _try_read_headers(path, password=pw)
+            password = pw
 
-        self.encoding = enc
-        self.headers = headers
-        self.excel_sheet_titles = sheet_titles
-        self.detected_date_keys = detected_date_keys
-        self.sample_values_by_header = sample_values
-
-        # Safety guard: our per-column mapping uses the header text as a key.
-        # If headers repeat, we can't reliably know which column a rule applies to.
-        if len(set(self.headers)) != len(self.headers):
-            messagebox.showerror(
-                "Unsupported file",
-                "This file has duplicate (repeated) column headers. Please fix the headers so each column name is unique, then try again.",
+        # Safety guard: per-column mapping uses the header text as a key.
+        if len(set(headers)) != len(headers):
+            raise ValueError(
+                "duplicate column headers. Fix the headers so each column name is unique, then try again."
             )
-            self.headers = []
-            self.selected_sheets = None
-            return
 
-        # If output path not chosen yet, set a sensible default next to input.
-        if not self.output_path:
-            stem = os.path.splitext(os.path.basename(path))[0]
-            in_ext = os.path.splitext(path)[1].lower()
-            out_ext = ".xlsx" if in_ext in [".xlsx", ".xlsm"] else ".csv"
-            self.output_path = os.path.join(os.path.dirname(path), f"{stem} Scrambled{out_ext}")
+        return LoadedFile(
+            path=path,
+            encoding=enc,
+            password=password,
+            sheet_titles=sheet_titles,
+            headers=headers,
+            detected_date_keys=detected_date_keys,
+            sample_values=sample_values,
+        )
 
-        # PIPELINE STEP 2: Show the header list + dropdown modes with sensible defaults.
-        self._render_header_controls()
-        self.status_var.set("Ready. Review column rules, then click Run Scramble.")
+    def _input_label_text(self) -> str:
+        if not self.files:
+            return "(no file selected)"
+        names = [os.path.basename(f.path) for f in self.files]
+        if len(names) == 1:
+            return names[0]
+        shown = ", ".join(names)
+        if len(shown) > 80:
+            shown = shown[:77] + "…"
+        return f"{len(names)} files: {shown}"
+
+    def _update_output_controls(self) -> None:
+        # One file can still pick a custom output path. Several files each
+        # write a sibling "Name Scrambled" file next to the source.
+        if len(self.files) == 1:
+            self.output_button.configure(state="normal")
+            if not self.output_path:
+                self.output_path = _default_output_path(self.files[0].path)
+        else:
+            self.output_button.configure(state="disabled")
+            self.output_path = None
 
     def choose_output(self) -> None:
-        # PIPELINE STEP 1B: User chooses where the output file will be saved.
-        # (We default the extension based on the input file type.)
-        initialdir = os.path.dirname(self.input_path) if self.input_path else os.getcwd()
-        if self.input_path:
-            in_ext = os.path.splitext(self.input_path)[1].lower()
-            out_ext = ".xlsx" if in_ext in [".xlsx", ".xlsm"] else ".csv"
-            initialfile = os.path.splitext(os.path.basename(self.input_path))[0] + f" Scrambled{out_ext}"
-            def_ext = out_ext
-        else:
-            initialfile = "Scrambled.csv"
-            def_ext = ".csv"
+        # PIPELINE STEP 1B: Single-file runs can choose where the output is saved.
+        if len(self.files) != 1:
+            return
+        source = self.files[0].path
+        initialdir = os.path.dirname(source) if source else os.getcwd()
+        in_ext = os.path.splitext(source)[1].lower()
+        out_ext = ".xlsx" if in_ext in [".xlsx", ".xlsm"] else ".csv"
+        initialfile = os.path.splitext(os.path.basename(source))[0] + f" Scrambled{out_ext}"
         path = filedialog.asksaveasfilename(
-            title="Choose where to save the scrambled CSV",
-            defaultextension=def_ext,
+            title="Choose where to save the scrambled file",
+            defaultextension=out_ext,
             initialdir=initialdir,
             initialfile=initialfile,
             filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx"), ("All files", "*.*")],
@@ -488,280 +576,444 @@ class App(tk.Tk):
         self.output_path = path
         self.status_var.set(f"Output set to: {os.path.basename(path)}")
 
-    def _filtered_headers(self) -> List[str]:
-        """Column keys (`Header (SheetTitle)`) restricted to selected worksheets when set."""
-        if not self.headers:
-            return []
-        if self.selected_sheets is None:
-            return self.headers
-        sel = set(self.selected_sheets)
-        out: List[str] = []
-        for h in self.headers:
-            for st in sel:
-                if h.endswith(f" ({st})"):
-                    out.append(h)
-                    break
-        return out
+    def _filtered_headers(self, loaded: LoadedFile) -> List[str]:
+        """Column keys restricted to the worksheets chosen for this file."""
+        if loaded.selected_sheets is None:
+            return list(loaded.headers)
+        sel = set(loaded.selected_sheets)
+        return [h for h in loaded.headers if _sheet_of_key(h, loaded.sheet_titles) in sel]
 
-    def _build_field_groups(self, hdr_subset: List[str]) -> List[Tuple[str, List[str]]]:
+    def _file_has_bare_header(self, loaded: LoadedFile, bare: str) -> bool:
+        return any(_bare_header(h, loaded.sheet_titles) == bare for h in self._filtered_headers(loaded))
+
+    def _link_mode(self, bare: str) -> Optional[str]:
+        for loaded in self.files:
+            for key, var in loaded.mode_vars.items():
+                if _bare_header(key, loaded.sheet_titles) == bare:
+                    return var.get()
+        return None
+
+    def _sync_link_modes(self, bare: str, mode: str) -> None:
+        """Every column with this header uses the same dropdown mode."""
+        if self._syncing_modes:
+            return
+        self._syncing_modes = True
+        try:
+            for loaded in self.files:
+                for key, var in loaded.mode_vars.items():
+                    if _bare_header(key, loaded.sheet_titles) == bare and var.get() != mode:
+                        var.set(mode)
+        finally:
+            self._syncing_modes = False
+
+    def _on_mode_selected(self, bare: str, mode: str) -> None:
+        if self.link_header_var.get() != bare:
+            return
+        self._sync_link_modes(bare, mode)
+
+    def _build_field_groups(self, loaded: LoadedFile, hdr_subset: List[str]) -> List[Tuple[str, List[str]]]:
         """Date / Program-Project / Other groups over a subset of column keys."""
         groups: List[Tuple[str, List[str]]] = [
-            ("Date fields (detected from data)", [h for h in hdr_subset if h in self.detected_date_keys]),
+            ("Date fields (detected from data)", [h for h in hdr_subset if h in loaded.detected_date_keys]),
             ("Program/Project fields", [h for h in hdr_subset if is_program_project_stable_header(h)]),
         ]
         assigned = set(groups[0][1]) | set(groups[1][1])
         groups.append(("Other fields", [h for h in hdr_subset if h not in assigned]))
         return groups
 
-    def _render_column_row(self, h: str, *, initial_mode: str = "no scramble") -> None:
+    def _render_column_row(self, loaded: LoadedFile, h: str) -> None:
+        bare = _bare_header(h, loaded.sheet_titles)
         row = ttk.Frame(self.scroll.inner)
         row.pack(fill="x", pady=(4, 4))
-        self.column_row_frames[h] = row
+        self.column_row_frames[(loaded.path, h)] = row
+
+        var = loaded.mode_vars.get(h)
+        if var is None:
+            var = tk.StringVar(value="no scramble")
+            loaded.mode_vars[h] = var
+
+        ttk.Radiobutton(
+            row,
+            variable=self.link_header_var,
+            value=bare,
+            command=lambda b=bare, mv=var: self._sync_link_modes(b, mv.get()),
+        ).pack(side="left", anchor="n", padx=(0, 6))
 
         left = ttk.Frame(row)
         left.pack(side="left", fill="both", expand=True, anchor="nw")
-        ttk.Label(left, text=h, wraplength=540, justify="left").pack(anchor="nw")
-        sample_text = _samples_preview_text(self.sample_values_by_header.get(h, []))
+        ttk.Label(left, text=h, wraplength=520, justify="left").pack(anchor="nw")
+        sample_text = _samples_preview_text(loaded.sample_values.get(h, []))
         ttk.Label(
             left,
             text=sample_text,
             font=("Segoe UI", 9),
             foreground="#666",
-            wraplength=540,
+            wraplength=520,
             justify="left",
         ).pack(anchor="nw", pady=(2, 0))
 
-        is_date = h in self.detected_date_keys
-        var = tk.StringVar(value=initial_mode)
-        self.mode_vars[h] = var
-
         cb = ttk.Combobox(row, textvariable=var, values=MODES, state="readonly", width=18)
         cb.pack(side="left", padx=(8, 0), anchor="n")
+        cb.bind(
+            "<<ComboboxSelected>>",
+            lambda _event, b=bare, mv=var: self._on_mode_selected(b, mv.get()),
+        )
 
-        if is_date:
+        if h in loaded.detected_date_keys:
             ttk.Label(row, text="(date rules available)", foreground="#666").pack(side="left", padx=(8, 0), anchor="n")
 
     def _clear_scroll(self) -> None:
         for w in self.scroll.inner.winfo_children():
             w.destroy()
 
-    def _render_header_controls(self) -> None:
-        # PIPELINE STEP 2: Render the header list grouped into:
-        # - Multi-sheet Excel: Worksheet sections, each with Date / Program-Project / Other.
-        # - CSV or single-sheet Excel: flat Date / Program / Other (no worksheet heading).
-        #
-        # Each row gets a dropdown with the column handling mode.
-        # Preserve any mode values the user already set before this re-render.
-        old_modes = {h: v.get() for h, v in self.mode_vars.items()}
-        self._clear_scroll()
-        self.mode_vars = {}
-        self.column_row_frames = {}
-
-        if self.excel_sheet_titles:
-            if self.selected_sheets is not None:
-                listed = ", ".join(self.selected_sheets)
+    def _update_sheet_hint(self) -> None:
+        if len(self.files) == 1 and self.files[0].sheet_titles:
+            loaded = self.files[0]
+            if loaded.selected_sheets is not None:
+                listed = ", ".join(loaded.selected_sheets)
                 self.sheet_hint_label.config(
-                    text=f"{len(self.selected_sheets)} sheet(s) selected for export: {listed} — "
+                    text=f"{len(loaded.selected_sheets)} sheet(s) selected for export: {listed} — "
                     "rules below apply only to included worksheet tabs."
                 )
             else:
-                listed = ", ".join(self.excel_sheet_titles)
+                listed = ", ".join(loaded.sheet_titles)
                 self.sheet_hint_label.config(
-                    text=f"{len(self.excel_sheet_titles)} sheet(s): {listed} — column rules apply to every worksheet tab."
+                    text=f"{len(loaded.sheet_titles)} sheet(s): {listed} — column rules apply to every worksheet tab."
                 )
-        else:
-            self.sheet_hint_label.config(text="")
+            return
+        if len(self.files) > 1:
+            self.sheet_hint_label.config(
+                text=f"{len(self.files)} files. Each scrambled file is saved next to its source."
+            )
+            return
+        self.sheet_hint_label.config(text="")
 
-        hdr_list = self._filtered_headers()
-        n_total = len(hdr_list)
+    def _render_header_controls(self) -> None:
+        # PIPELINE STEP 2: Render the header list grouped into:
+        # - Several files: a File section, then worksheet sections when a workbook has multiple tabs.
+        # - One multi-sheet Excel file: Worksheet sections, each with Date / Program-Project / Other.
+        # - One CSV or single-sheet Excel file: flat Date / Program / Other (no file or worksheet heading).
+        #
+        # Mode vars live on each LoadedFile, so a re-render keeps the user's dropdown choices.
+        self._clear_scroll()
+        self.column_row_frames = {}
+        self._update_sheet_hint()
+
+        n_total = sum(len(self._filtered_headers(loaded)) for loaded in self.files)
         self.total_fields_label.config(text=f"Total fields: {n_total}" if n_total else "")
 
-        multi_sheet_excel = bool(self.excel_sheet_titles) and len(self.excel_sheet_titles) > 1
-
-        def render_groups(groups: List[Tuple[str, List[str]]]) -> None:
-            for group_name, headers in groups:
-                if not headers:
-                    continue
-                header_lbl = ttk.Label(
-                    self.scroll.inner,
-                    text=f"{group_name} — {len(headers)} fields",
-                    font=("Segoe UI", 10, "bold"),
-                )
-                header_lbl.pack(anchor="w", pady=(10, 4))
-
-                for h in headers:
-                    self._render_column_row(h, initial_mode=old_modes.get(h, "no scramble"))
-
-        if multi_sheet_excel:
-            sheet_order = self.selected_sheets if self.selected_sheets is not None else self.excel_sheet_titles
-            first_sheet_section = True
-            for st in sheet_order:
-                sheet_headers = [h for h in hdr_list if h.endswith(f" ({st})")]
-                if not sheet_headers:
-                    continue
+        show_file_heading = len(self.files) > 1
+        first_file_section = True
+        for loaded in self.files:
+            if show_file_heading:
                 ttk.Label(
                     self.scroll.inner,
-                    text=f"Worksheet: {st}",
+                    text=f"File: {os.path.basename(loaded.path)}",
                     font=("Segoe UI", 11, "bold"),
-                ).pack(anchor="w", pady=(22, 6) if not first_sheet_section else (8, 6))
-                first_sheet_section = False
-                groups = self._build_field_groups(sheet_headers)
-                render_groups(groups)
-        else:
-            groups = self._build_field_groups(hdr_list)
-            render_groups(groups)
+                ).pack(anchor="w", pady=(22, 6) if not first_file_section else (8, 6))
+                first_file_section = False
+            self._render_file_columns(loaded)
 
-        warning = ttk.Label(
-            self.scroll.inner,
-            text="Note: “Full scramble” will scramble dates/times too (no date rules). Use “Date scramble” for stable month/year and DOB bucket preservation.",
-            foreground="#884400",
-            wraplength=820,
-        )
-        warning.pack(anchor="w", pady=(14, 0))
+        if self.files:
+            warning = ttk.Label(
+                self.scroll.inner,
+                text="Note: “Full scramble” will scramble dates/times too (no date rules). Use “Date scramble” for stable month/year and DOB bucket preservation.",
+                foreground="#884400",
+                wraplength=820,
+            )
+            warning.pack(anchor="w", pady=(14, 0))
 
-    def run(self) -> None:
-        # PIPELINE STEP 3: Validate inputs, collect the chosen dropdown modes,
-        # then run the scramble operation in a background thread.
-        if not self.input_path or not self.headers:
-            messagebox.showinfo("Select a file", "Please choose a CSV or Excel file first.")
+    def _render_groups(self, loaded: LoadedFile, groups: List[Tuple[str, List[str]]]) -> None:
+        for group_name, headers in groups:
+            if not headers:
+                continue
+            ttk.Label(
+                self.scroll.inner,
+                text=f"{group_name} — {len(headers)} fields",
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w", pady=(10, 4))
+            for h in headers:
+                self._render_column_row(loaded, h)
+
+    def _render_file_columns(self, loaded: LoadedFile) -> None:
+        hdr_list = self._filtered_headers(loaded)
+        multi_sheet = len(loaded.sheet_titles) > 1
+        if not multi_sheet:
+            self._render_groups(loaded, self._build_field_groups(loaded, hdr_list))
             return
-        if not self.output_path:
-            self.choose_output()
-            if not self.output_path:
-                return
 
-        out_ext = os.path.splitext(self.output_path)[1].lower()
+        sheet_order = loaded.selected_sheets if loaded.selected_sheets is not None else loaded.sheet_titles
+        first_sheet_section = True
+        for st in sheet_order:
+            sheet_headers = [h for h in hdr_list if _sheet_of_key(h, loaded.sheet_titles) == st]
+            if not sheet_headers:
+                continue
+            ttk.Label(
+                self.scroll.inner,
+                text=f"Worksheet: {st}",
+                font=("Segoe UI", 11, "bold"),
+            ).pack(anchor="w", pady=(22, 6) if not first_sheet_section else (8, 6))
+            first_sheet_section = False
+            self._render_groups(loaded, self._build_field_groups(loaded, sheet_headers))
 
-        if len(self.excel_sheet_titles) > 1:
-            dlg = SheetPickerDialog(self, self.excel_sheet_titles)
+    def _selected_link_header(self) -> Optional[str]:
+        raw = self.link_header_var.get()
+        if not raw or raw == _NO_LINK:
+            return None
+        return raw
+
+    def _pick_sheets(self) -> bool:
+        """Ask which tabs to export for each multi-sheet workbook. Return False if cancelled."""
+        pending: List[Optional[List[str]]] = []
+        for loaded in self.files:
+            if len(loaded.sheet_titles) <= 1:
+                pending.append(None)
+                continue
+            dlg = SheetPickerDialog(self, loaded.sheet_titles)
+            dlg.title(f"Select sheets to export — {os.path.basename(loaded.path)}")
             self.wait_window(dlg)
             if dlg.result is None:
-                return
+                return False
             selected = dlg.result
             try:
                 breaks = detect_cross_sheet_cf_breaks(
-                    self.input_path or "",
+                    loaded.path,
                     selected,
-                    password=self.xlsx_password,
+                    password=loaded.password,
                 )
             except EncryptedXlsxError:
                 messagebox.showerror(
                     "Password required",
-                    "Could not re-open the workbook to check sheet dependencies. Try selecting the file again.",
+                    f"Could not re-open {os.path.basename(loaded.path)} to check sheet dependencies. "
+                    "Try selecting the file again.",
                 )
-                return
+                return False
             except Exception as e:
                 messagebox.showerror("Could not check sheet dependencies", str(e))
-                return
+                return False
             if breaks:
                 warn_text = "\n".join(f"  • {b}" for b in breaks[:25])
                 if len(breaks) > 25:
                     warn_text += f"\n  … and {len(breaks) - 25} more"
                 proceed = messagebox.askyesno(
                     "Cross-sheet dependency warning",
-                    "Excluding sheets may break these conditional formatting relationships:\n\n"
+                    f"{os.path.basename(loaded.path)}: excluding sheets may break these "
+                    "conditional formatting relationships:\n\n"
                     f"{warn_text}\n\nProceed anyway?",
                 )
                 if not proceed:
-                    return
-            self.selected_sheets = selected
-            self._render_header_controls()
-        else:
-            self.selected_sheets = None
+                    return False
+            pending.append(selected)
 
-        n_export_sheets = (
-            len(self.selected_sheets)
-            if self.selected_sheets is not None
-            else max(1, len(self.excel_sheet_titles))
-        )
-        if len(self.excel_sheet_titles) > 0 and out_ext == ".csv" and n_export_sheets > 1:
+        for loaded, selected in zip(self.files, pending):
+            loaded.selected_sheets = selected
+        self._render_header_controls()
+        return True
+
+    def _output_path_for(self, loaded: LoadedFile) -> str:
+        if len(self.files) == 1 and self.output_path:
+            return self.output_path
+        return _default_output_path(loaded.path)
+
+    def _keyed_output_path(self, output_path: str) -> str:
+        base, ext = os.path.splitext(output_path)
+        return f"{base} (KEYED ORIGINAL){ext or '.xlsx'}"
+
+    def _output_is_locked(self, path: str) -> bool:
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "ab"):
+                pass
+        except PermissionError:
             messagebox.showerror(
-                "Cannot use CSV output",
-                "Cannot save more than one worksheet as a CSV file.\n\n"
-                "Choose an output path ending in .xlsx, or select only one sheet in the sheet picker, "
-                "or save sheets separately outside this tool.",
+                "Output file is open",
+                f"Cannot write to:\n{path}\n\n"
+                "The file is open in another program (Excel, OneDrive sync, etc.).\n\n"
+                "Close the file and try again.",
+            )
+            return True
+        return False
+
+    def run(self) -> None:
+        # PIPELINE STEP 3: Validate inputs, collect the chosen dropdown modes,
+        # then run the scramble operation in a background thread.
+        if not self.files:
+            messagebox.showinfo("Select files", "Please choose a CSV or Excel file first.")
+            return
+
+        link_header = self._selected_link_header()
+        if len(self.files) > 1 and link_header is None:
+            messagebox.showinfo(
+                "Select a shared field",
+                "Choose the field that should keep the same scrambled values across files.\n\n"
+                "Click the circle to the left of that column.",
             )
             return
 
-        # Pre-flight: verify the output file (and keyed original if requested) is not locked
-        # by Excel, OneDrive, or another process. Check now so the user isn't left waiting
-        # through a long scramble only to get a PermissionError on save.
-        paths_to_check: List[str] = [self.output_path or ""]
-        if bool(self.keyed_var.get()) and self.output_path:
-            base, ext = os.path.splitext(self.output_path)
-            paths_to_check.append(f"{base} (KEYED ORIGINAL){ext or '.xlsx'}")
-        for _check_path in paths_to_check:
-            if _check_path and os.path.exists(_check_path):
-                try:
-                    with open(_check_path, "ab"):
-                        pass
-                except PermissionError:
-                    messagebox.showerror(
-                        "Output file is open",
-                        f"Cannot write to:\n{_check_path}\n\n"
-                        "The file is open in another program (Excel, OneDrive sync, etc.).\n\n"
-                        "Close the file and try again.",
-                    )
-                    return
+        link_mode: Optional[ScrambleMode] = None
+        if link_header is not None:
+            chosen = self._link_mode(link_header)
+            if chosen not in _LINK_MODES:
+                shown = chosen if chosen else "no scramble"
+                messagebox.showerror(
+                    "Choose a scramble mode",
+                    f"“{link_header}” is set to {shown}.\n\n"
+                    "The shared field must use Full scramble or Date scramble so each original "
+                    "value always becomes the same scrambled value.",
+                )
+                return
+            link_mode = chosen  # type: ignore[assignment]
 
-        hdr_for_modes = self._filtered_headers()
-        if not hdr_for_modes:
-            messagebox.showinfo("No columns", "There are no columns to scramble for the current selection.")
+        if len(self.files) == 1 and not self.output_path:
+            self.choose_output()
+            if not self.output_path:
+                return
+
+        if not self._pick_sheets():
             return
 
-        header_modes: Dict[str, ScrambleMode] = {}
-        for h in hdr_for_modes:
-            var = self.mode_vars.get(h)
-            if var is None:
-                header_modes[h] = "no scramble"
-            else:
-                header_modes[h] = var.get()  # type: ignore[assignment]
+        if len(self.files) == 1 and self.output_path:
+            loaded = self.files[0]
+            out_ext = os.path.splitext(self.output_path)[1].lower()
+            n_export = (
+                len(loaded.selected_sheets)
+                if loaded.selected_sheets is not None
+                else max(1, len(loaded.sheet_titles))
+            )
+            if loaded.sheet_titles and out_ext == ".csv" and n_export > 1:
+                messagebox.showerror(
+                    "Cannot use CSV output",
+                    "Cannot save more than one worksheet as a CSV file.\n\n"
+                    "Choose an output path ending in .xlsx, or select only one sheet in the sheet picker, "
+                    "or save sheets separately outside this tool.",
+                )
+                return
 
+        for loaded in self.files:
+            if not self._filtered_headers(loaded):
+                messagebox.showinfo(
+                    "No columns",
+                    f"{os.path.basename(loaded.path)} has no columns to scramble for the current selection.",
+                )
+                return
+
+        missing: List[str] = []
+        if link_header is not None:
+            missing = [
+                os.path.basename(loaded.path)
+                for loaded in self.files
+                if not self._file_has_bare_header(loaded, link_header)
+            ]
+            if missing:
+                listed = "\n".join(f"  • {name}" for name in missing)
+                proceed = messagebox.askyesno(
+                    "Field not in every file",
+                    f"“{link_header}” is not a column in:\n\n{listed}\n\n"
+                    "The shared scrambled values will apply only where that column exists.\n\n"
+                    "Proceed anyway?",
+                )
+                if not proceed:
+                    return
+
+        create_keyed = bool(self.keyed_var.get())
+        jobs: List[Tuple[LoadedFile, str, Dict[str, ScrambleMode]]] = []
+        for loaded in self.files:
+            output_path = self._output_path_for(loaded)
+            if self._output_is_locked(output_path):
+                return
+            if create_keyed and self._output_is_locked(self._keyed_output_path(output_path)):
+                return
+            header_modes: Dict[str, ScrambleMode] = {}
+            for h in self._filtered_headers(loaded):
+                var = loaded.mode_vars.get(h)
+                header_modes[h] = var.get() if var is not None else "no scramble"  # type: ignore[assignment]
+            jobs.append((loaded, output_path, header_modes))
+
+        link_seed = secrets.token_bytes(32) if link_header is not None else None
         self.status_var.set("Running…")
 
         def worker() -> None:
-            # PIPELINE STEP 4: Call the core pipeline which:
-            # - reads rows
-            # - applies per-column modes
-            # - optionally creates keyed original
-            # - writes output file(s)
+            # PIPELINE STEP 4: Scramble each file. The shared field uses one seed
+            # for the whole run. Every other column uses that file's own seed.
             try:
-                res = scramble_tabular_file(
-                    input_path=self.input_path or "",
-                    output_scrambled_path=self.output_path or "",
-                    header_modes=header_modes,
-                    create_keyed_normal_version=bool(self.keyed_var.get()),
-                    encoding=self.encoding,
-                    password=self.xlsx_password,
-                    include_sheets=self.selected_sheets,
-                )
-                msg = f"Done.\n\nScrambled file:\n{res.scrambled_output_path}"
-                if res.keyed_original_output_path:
-                    msg += f"\n\nKeyed original file:\n{res.keyed_original_output_path}"
-                msg += f"\n\nRows processed: {res.row_count}"
-                if res.warnings:
-                    skipped = "\n".join(f"  • {w}" for w in res.warnings[:10])
-                    if len(res.warnings) > 10:
-                        skipped += f"\n  … and {len(res.warnings) - 10} more"
-                    msg += f"\n\nNote: {len(res.warnings)} conditional formatting rule(s) could not be shifted and were skipped:\n{skipped}"
+                parts = ["Done."]
+                if link_header:
+                    parts.append(f"\nShared field: {link_header}")
+                warnings: List[str] = []
+                saved_any = False
+                for loaded, output_path, header_modes in jobs:
+                    try:
+                        res = scramble_tabular_file(
+                            input_path=loaded.path,
+                            output_scrambled_path=output_path,
+                            header_modes=header_modes,
+                            create_keyed_normal_version=create_keyed,
+                            encoding=loaded.encoding,
+                            password=loaded.password,
+                            include_sheets=loaded.selected_sheets,
+                            link_header=link_header,
+                            link_mode=link_mode,
+                            link_seed=link_seed,
+                        )
+                    except ShuffleValuesError as e:
+                        err = e
+                        path = loaded.path
+                        prefix = ""
+                        if saved_any:
+                            prefix = "Files earlier in this run were already saved.\n\n"
+                        self.after(0, lambda err=err, path=path, prefix=prefix: self._on_shuffle_values_error(err, path, prefix))
+                        return
+                    except Exception as e:
+                        details = traceback.format_exc()
+                        name = os.path.basename(loaded.path)
+                        prefix = ""
+                        if saved_any:
+                            prefix = "Files earlier in this run were already saved.\n\n"
+                        self.after(
+                            0,
+                            lambda name=name, err=e, details=details, prefix=prefix: self._on_error(
+                                f"{prefix}{name}\n\n{err}\n\nDetails:\n{details}"
+                            ),
+                        )
+                        return
+                    saved_any = True
+                    parts.append(f"\nScrambled file:\n{res.scrambled_output_path}")
+                    if res.keyed_original_output_path:
+                        parts.append(f"Keyed original file:\n{res.keyed_original_output_path}")
+                    parts.append(f"Rows processed: {res.row_count}")
+                    warnings.extend(res.warnings)
 
-                self.after(0, lambda: self._on_success(msg))
-            except ShuffleValuesError as e:
-                self.after(0, lambda err=e: self._on_shuffle_values_error(err))
+                if missing and link_header:
+                    listed = "\n".join(f"  • {name}" for name in missing)
+                    parts.append(
+                        f"\nNo column “{link_header}” in:\n{listed}\n"
+                        "Those files were scrambled without shared values."
+                    )
+                if warnings:
+                    skipped = "\n".join(f"  • {w}" for w in warnings[:10])
+                    if len(warnings) > 10:
+                        skipped += f"\n  … and {len(warnings) - 10} more"
+                    parts.append(
+                        f"\nNote: {len(warnings)} conditional formatting rule(s) could not be shifted and were skipped:\n{skipped}"
+                    )
+                msg = "\n".join(parts)
+                self.after(0, lambda msg=msg: self._on_success(msg))
             except Exception as e:
                 details = traceback.format_exc()
-                self.after(0, lambda: self._on_error(f"{e}\n\nDetails:\n{details}"))
+                self.after(0, lambda err=e, details=details: self._on_error(f"{err}\n\nDetails:\n{details}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_shuffle_values_error(self, e: ShuffleValuesError) -> None:
+    def _on_shuffle_values_error(self, e: ShuffleValuesError, path: str, prefix: str = "") -> None:
         key = getattr(e, "column_key", None)
-        if key and key in self.column_row_frames:
+        widget = self.column_row_frames.get((path, key)) if key else None
+        if widget is not None:
             try:
-                self.scroll.scroll_row_into_view(self.column_row_frames[key])
+                self.scroll.scroll_row_into_view(widget)
             except Exception:
                 pass
-        self._on_error(f"Shuffle values error:\n\n{e}")
+        self._on_error(f"{prefix}Shuffle values error in {os.path.basename(path)}:\n\n{e}")
 
     def _on_success(self, msg: str) -> None:
         self.status_var.set("Complete.")
@@ -773,16 +1025,17 @@ class App(tk.Tk):
 
 
 def main() -> int:
-    # PIPELINE STEP 0: Launch the app.
+    # PIPELINE STEP 0: Launch the app, then open the file picker.
     app = App()
+    app.after(200, app.choose_files)
     app.mainloop()
     return 0
 
 
 # COMMON EDITS (for maintainers)
 # - Change the version shown to staff: update APP_VERSION above.
-# - Change which file types are allowed: update choose_input() filetypes + scrambler_core.scramble_tabular_file().
-# - Change the default dropdown selections: edit initial mode in _render_header_controls() (default "no scramble").
+# - Change which file types are allowed: update choose_files() filetypes + scrambler_core.scramble_tabular_file().
+# - Change the default dropdown selections: edit the "no scramble" default in _render_column_row().
 
 
 if __name__ == "__main__":
